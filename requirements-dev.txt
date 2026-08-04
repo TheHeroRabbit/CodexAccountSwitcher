@@ -1,2 +1,2 @@
 -r requirements-build.txt
-ruff==0.12.12
+ruff==0.16.1
