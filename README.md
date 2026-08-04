@@ -9,6 +9,7 @@ Codex 切换器是一款仅在本机运行的 Windows 桌面工具，用于管�
 ## 功能
 
 - 从当前 Codex 或指定的 `auth.json` 添加 OpenAI 账号。
+- 切换前自动保存 Codex 已刷新并回写的最新 ChatGPT 认证，避免恢复过期快照。
 - 更新认证副本、修改备注、移除账号并保留必要备份。
 - 切换 OpenAI 账号后自动重启 Microsoft Store 版 Codex。
 - 切换到 DeepSeek V4 Flash，并精确恢复切换前的 OpenAI 配置。
@@ -19,6 +20,9 @@ Codex 切换器是一款仅在本机运行的 Windows 桌面工具，用于管�
 ## 安全设计
 
 - 账号认证副本仅保存在 EXE 同级的“账号文件”目录。
+- ChatGPT 账号只通过 `auth_mode` 与 `tokens.account_id` 的不可逆内存指纹匹配；账号 ID、邮箱和令牌不会写入账号清单、日志或界面。
+- 自动同步只在 Codex 已停止、账号唯一匹配且原副本哈希可信时执行；保存前再次比较预期旧哈希，身份重复、错配、并发更新或外部修改都会停止覆盖。
+- 账号存储以及账号/模型服务完整切换事务使用进程内可重入锁与跨进程锁文件串行化，避免多个程序实例交叉停止客户端或互相覆盖；锁等待超时会在停止 Codex 和修改文件前安全退出。
 - DeepSeek API Key 保存在 Windows 凭据管理器，界面只显示末四位。
 - 模型服务恢复状态使用当前 Windows 用户的 DPAPI 加密。
 - 配置和认证文件采用临时文件、落盘同步和原子替换。
@@ -26,6 +30,8 @@ Codex 切换器是一款仅在本机运行的 Windows 桌面工具，用于管�
 - 发布包不会包含本机账号数据、Codex 配置或 Windows 凭据。
 
 使用 DeepSeek 期间，Codex 会按官方配置要求从 `%USERPROFILE%\.codex\config.toml` 读取 API Key；切回 OpenAI 后，本程序会移除受管的 DeepSeek 配置并恢复原状态。
+
+ChatGPT 登录令牌的获取、刷新和失效判断仍完全由 Codex 官方客户端负责。本程序不调用私有 OAuth 接口，也不硬编码刷新周期；它只在下一次账号切换覆盖 `auth.json` 之前，保存 Codex 已经写回的最新文件。
 
 ## 环境要求
 
@@ -94,7 +100,12 @@ GitHub Actions 会在 Windows 环境中重复执行静态检查、格式检查�
 ## 兼容性与限制
 
 - 当前自动重启仅适用于 Microsoft Store 版 Codex；其他安装方式需要手动重启。
-- 截至 2026-08-04，[DeepSeek 官方 Codex 接入文档](https://api-docs.deepseek.com/zh-cn/quick_start/agent_integrations/codex/)仍仅明确支持 `deepseek-v4-flash`，因此界面不会提前开放 `deepseek-v4-pro`。
+- 自动同步适用于当前带有 `auth_mode: "chatgpt"` 和 `tokens.account_id` 的 Codex 托管 ChatGPT 认证。旧格式和 API Key 认证可继续读取、添加和切换，同模式 API Key 及两侧都不是 ChatGPT 的旧格式仍可手动更新，但不会执行 ChatGPT 令牌自动同步；如果旧 ChatGPT 认证缺少可验证身份，程序会拒绝把变化后的 ChatGPT/API Key 文件手动覆盖到该记录，请移除旧记录并重新添加当前认证。
+- 自动同步以 Codex 实际写回 `.codex/auth.json` 为前提；若 Codex 被配置为只把凭据保存在操作系统凭据存储中，本程序无法同步未出现在该文件里的更新。
+- 自动同步不能保证永久免登录。刷新令牌被撤销、真正过期，或受到 MFA、密码、安全设置及组织策略影响时，Codex 仍可能要求重新登录。
+- 如果旧版本已经保存了同一 ChatGPT 身份的多个副本，程序会停止自动覆盖并要求先保留正确记录，避免把最新令牌写错账号项。
+- 跨进程锁用于协调本工具的实例；其他程序不会自动遵守该锁。切换期间应避免用第三方工具同时修改 `auth.json` 或账号目录。程序会在判断、备份和写入后多次校验哈希，但独立锁文件不是对任意外部写入的内核级强制锁。
+- 本版本的 DeepSeek 页面仅开放已经完成配置事务、失败回滚、界面与发布物端到端验收的 `deepseek-v4-flash`。仓库中包含的其他模型元数据不代表本版本已经承诺支持；扩展开放范围前需要单独完成兼容性与回滚验收。
 - 发布的 EXE 未使用商业代码签名证书，Windows 首次运行时可能显示安全提示。
 - 本项目不会联网验证 API Key；真实调用可能产生费用，由用户自行确认。
 

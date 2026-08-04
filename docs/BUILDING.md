@@ -119,14 +119,14 @@ CodexAccountSwitcher/
 
 ```text
 release/
-├── Codex账号切换器-v1.3.0/
+├── Codex账号切换器-v1.4.0/
 │   ├── Codex账号切换器.exe
 │   ├── SHA256.txt
 │   ├── 使用说明.txt
 │   ├── 更新说明.txt
 │   └── 账号文件/请勿分享此文件夹.txt
-├── Codex账号切换器-v1.3.0.zip
-└── Codex账号切换器-v1.3.0.zip.sha256.txt
+├── Codex账号切换器-v1.4.0.zip
+└── Codex账号切换器-v1.4.0.zip.sha256.txt
 ```
 
 脚本默认拒绝覆盖同名发布结果。确认目标确实是本项目 `release\` 后，可使用 `-Force` 重建。

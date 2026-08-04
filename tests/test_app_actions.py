@@ -138,6 +138,27 @@ class AccountSwitcherActionTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    @staticmethod
+    def managed_auth(account_id: str, generation: str):
+        return {
+            "auth_mode": "chatgpt",
+            "last_refresh": "2026-08-0{}T00:00:00Z".format(generation),
+            "OPENAI_API_KEY": None,
+            "tokens": {
+                "account_id": account_id,
+                "access_token": "access-{}".format(generation),
+                "id_token": "identity-{}".format(generation),
+                "refresh_token": "refresh-{}".format(generation),
+            },
+        }
+
+    def write_current_managed_auth(self, account_id: str, generation: str) -> None:
+        self.application.target_auth_path.parent.mkdir(parents=True, exist_ok=True)
+        self.application.target_auth_path.write_text(
+            json.dumps(self.managed_auth(account_id, generation)),
+            encoding="utf-8",
+        )
+
     def accept_confirm(self, *args, **kwargs) -> bool:
         self.confirms.append((args, kwargs))
         return True
@@ -216,6 +237,19 @@ class AccountSwitcherActionTests(unittest.TestCase):
         self.assertEqual(self.codex_client.stop_calls, 2)
         self.assertEqual(self.codex_client.start_calls, 2)
         self.assertEqual(self.notices[-1][0], "已切回 OpenAI")
+
+    def test_provider_switch_uses_the_same_cross_process_codex_lock(self) -> None:
+        self.application.store.lock_timeout = 0.1
+
+        with self.application.store.codex_operation_guard(self.application.target_auth_path):
+            self.application.toggle_provider()
+            self.wait_for_restart()
+
+        self.assertEqual(self.codex_client.stop_calls, 0)
+        self.assertEqual(self.codex_client.start_calls, 0)
+        self.assertEqual(self.provider_manager.mode, "openai")
+        self.assertEqual(self.notices[-1][0], "切换失败")
+        self.assertIn("Codex 操作锁", self.notices[-1][1])
 
     def test_account_switch_from_deepseek_restores_openai_before_start(self) -> None:
         events = []
@@ -315,6 +349,57 @@ class AccountSwitcherActionTests(unittest.TestCase):
 
         self.assertEqual(self.application.target_auth_path.read_bytes(), before)
         self.assertEqual(self.codex_client.calls, 0)
+
+    def test_switch_lock_timeout_happens_before_codex_is_stopped(self) -> None:
+        self.write_current_auth("saved")
+        StubRemarkDialog.results.append("测试账号")
+        self.application.add_from_current()
+        before = self.application.target_auth_path.read_bytes()
+        self.application.store.lock_timeout = 0.1
+        status_threads = []
+        original_status = self.provider_manager.status
+
+        def tracked_status():
+            status_threads.append(threading.current_thread().name)
+            return original_status()
+
+        self.provider_manager.status = tracked_status
+
+        with self.application.store.account_switch_guard(self.application.target_auth_path):
+            self.application.switch_selected_profile()
+            self.wait_for_restart()
+
+        self.assertNotIn("CodexRestartWorker", status_threads)
+        self.assertEqual(self.codex_client.stop_calls, 0)
+        self.assertEqual(self.codex_client.start_calls, 0)
+        self.assertEqual(self.application.target_auth_path.read_bytes(), before)
+        self.assertEqual(self.notices[-1][0], "切换失败")
+        self.assertIn("Codex 操作锁", self.notices[-1][1])
+
+    def test_unexpected_provider_status_failure_finishes_without_stopping_codex(self) -> None:
+        self.write_current_auth("saved")
+        StubRemarkDialog.results.append("测试账号")
+        self.application.add_from_current()
+
+        original_status = self.provider_manager.status
+        status_calls = 0
+
+        def fail_worker_status():
+            nonlocal status_calls
+            status_calls += 1
+            if status_calls == 1:
+                return original_status()
+            raise RuntimeError("simulated unexpected status failure")
+
+        self.provider_manager.status = fail_worker_status
+        self.application.switch_selected_profile()
+        self.wait_for_restart()
+
+        self.assertFalse(self.application.busy)
+        self.assertEqual(self.codex_client.stop_calls, 0)
+        self.assertEqual(self.codex_client.start_calls, 0)
+        self.assertEqual(self.notices[-1][0], "切换失败")
+        self.assertIn("系统未能检测当前模型服务", self.notices[-1][1])
         self.assertFalse(self.application.busy)
 
     def test_restart_failure_keeps_switched_auth_and_gives_manual_fallback(self) -> None:
@@ -365,19 +450,237 @@ class AccountSwitcherActionTests(unittest.TestCase):
                 events.append("start")
                 return 2400
 
+        original_sync = self.application.store.sync_current_profile
         original_switch = self.application.store.switch_profile
+
+        def tracked_sync(*args, **kwargs):
+            events.append("sync")
+            return original_sync(*args, **kwargs)
 
         def tracked_switch(*args, **kwargs):
             events.append("switch")
             return original_switch(*args, **kwargs)
 
         self.application.codex_client = OrderedClient()
+        self.application.store.sync_current_profile = tracked_sync
         self.application.store.switch_profile = tracked_switch
 
         self.application.switch_selected_profile()
         self.wait_for_restart()
 
-        self.assertEqual(events, ["stop", "switch", "start"])
+        self.assertEqual(events, ["stop", "sync", "switch", "start"])
+
+    def test_switch_saves_refreshed_current_profile_before_replacing_auth(self) -> None:
+        self.write_current_managed_auth("account-a", "1")
+        StubRemarkDialog.results.append("账号 A")
+        self.application.add_from_current()
+        account_a = self.application.profiles[0]
+        account_a_original = self.application.store.profile_path(account_a).read_bytes()
+
+        self.write_current_managed_auth("account-b", "1")
+        StubRemarkDialog.results.append("账号 B")
+        self.application.add_from_current()
+        account_b = next(item for item in self.application.profiles if item.remark == "账号 B")
+        account_b_bytes = self.application.store.profile_path(account_b).read_bytes()
+
+        self.write_current_managed_auth("account-a", "2")
+        refreshed_a_bytes = self.application.target_auth_path.read_bytes()
+        self.application.refresh_profiles(account_b.profile_id)
+
+        self.application.switch_selected_profile()
+        self.wait_for_restart()
+
+        refreshed_a = next(item for item in self.application.profiles if item.remark == "账号 A")
+        self.assertEqual(
+            self.application.store.profile_path(refreshed_a).read_bytes(),
+            refreshed_a_bytes,
+        )
+        self.assertEqual(self.application.target_auth_path.read_bytes(), account_b_bytes)
+        update_backups = list(self.application.store.update_backup_directory.glob("*.json"))
+        self.assertEqual(len(update_backups), 1)
+        self.assertEqual(update_backups[0].read_bytes(), account_a_original)
+        self.assertIn("已自动保存“账号 A”", self.notices[-1][1])
+
+    def test_failed_target_switch_refreshes_successfully_synced_current_profile(self) -> None:
+        self.write_current_managed_auth("account-a", "1")
+        StubRemarkDialog.results.append("账号 A")
+        self.application.add_from_current()
+
+        self.write_current_managed_auth("account-b", "1")
+        StubRemarkDialog.results.append("账号 B")
+        self.application.add_from_current()
+        account_b = next(item for item in self.application.profiles if item.remark == "账号 B")
+
+        self.write_current_managed_auth("account-a", "2")
+        refreshed_a_bytes = self.application.target_auth_path.read_bytes()
+        self.application.store.profile_path(account_b).write_text(
+            json.dumps({"token": "externally-modified"}),
+            encoding="utf-8",
+        )
+        self.application.refresh_profiles(account_b.profile_id)
+
+        self.application.switch_selected_profile()
+        self.wait_for_restart()
+
+        refreshed_a = next(item for item in self.application.profiles if item.remark == "账号 A")
+        self.assertEqual(
+            self.application.store.profile_path(refreshed_a).read_bytes(),
+            refreshed_a_bytes,
+        )
+        self.assertEqual(
+            refreshed_a.sha256,
+            app_module.validate_auth_file(self.application.store.profile_path(refreshed_a)),
+        )
+        self.assertEqual(self.application.target_auth_path.read_bytes(), refreshed_a_bytes)
+        self.assertEqual(self.notices[-1][0], "切换失败")
+        self.assertIn("已自动保存“账号 A”", self.notices[-1][1])
+        self.assertIn("目标账号切换未完成", self.notices[-1][1])
+
+    def test_switching_same_profile_keeps_refreshed_current_auth(self) -> None:
+        self.write_current_managed_auth("account-a", "1")
+        StubRemarkDialog.results.append("账号 A")
+        self.application.add_from_current()
+        account_a = self.application.profiles[0]
+        self.write_current_managed_auth("account-a", "2")
+        refreshed_bytes = self.application.target_auth_path.read_bytes()
+        self.application.refresh_profiles(account_a.profile_id)
+
+        self.application.switch_selected_profile()
+        self.wait_for_restart()
+
+        refreshed_a = self.application.profiles[0]
+        self.assertEqual(self.application.target_auth_path.read_bytes(), refreshed_bytes)
+        self.assertEqual(
+            self.application.store.profile_path(refreshed_a).read_bytes(),
+            refreshed_bytes,
+        )
+        self.assertEqual(list(self.application.store.backup_directory.glob("*.json")), [])
+        self.assertIn("已自动保存“账号 A”", self.notices[-1][1])
+
+    def test_deepseek_restore_failure_keeps_synced_account_and_rolls_back_target(self) -> None:
+        self.write_current_managed_auth("account-a", "1")
+        StubRemarkDialog.results.append("账号 A")
+        self.application.add_from_current()
+
+        self.write_current_managed_auth("account-b", "1")
+        StubRemarkDialog.results.append("账号 B")
+        self.application.add_from_current()
+        account_b = next(item for item in self.application.profiles if item.remark == "账号 B")
+        account_b_bytes = self.application.store.profile_path(account_b).read_bytes()
+
+        self.write_current_managed_auth("account-a", "2")
+        refreshed_a_bytes = self.application.target_auth_path.read_bytes()
+        self.provider_manager.mode = "deepseek"
+        self.provider_manager.restore_error = ProviderConfigError("模拟恢复失败")
+        self.application.refresh_provider_status(show_error=False)
+        self.application.refresh_profiles(account_b.profile_id)
+
+        self.application.switch_selected_profile()
+        self.wait_for_restart()
+
+        refreshed_a = next(item for item in self.application.profiles if item.remark == "账号 A")
+        self.assertEqual(
+            self.application.store.profile_path(refreshed_a).read_bytes(),
+            refreshed_a_bytes,
+        )
+        self.assertEqual(
+            self.application.store.profile_path(account_b).read_bytes(),
+            account_b_bytes,
+        )
+        self.assertEqual(self.application.target_auth_path.read_bytes(), refreshed_a_bytes)
+        self.assertEqual(self.provider_manager.mode, "deepseek")
+        self.assertEqual(self.notices[-1][0], "切换失败")
+        self.assertIn("模拟恢复失败", self.notices[-1][1])
+        self.assertEqual(
+            refreshed_a.sha256,
+            app_module.validate_auth_file(self.application.store.profile_path(refreshed_a)),
+        )
+        self.assertIn("已自动保存“账号 A”", self.notices[-1][1])
+
+    def test_restart_failure_keeps_target_and_prior_account_sync(self) -> None:
+        self.write_current_managed_auth("account-a", "1")
+        StubRemarkDialog.results.append("账号 A")
+        self.application.add_from_current()
+
+        self.write_current_managed_auth("account-b", "1")
+        StubRemarkDialog.results.append("账号 B")
+        self.application.add_from_current()
+        account_b = next(item for item in self.application.profiles if item.remark == "账号 B")
+        account_b_bytes = self.application.store.profile_path(account_b).read_bytes()
+
+        self.write_current_managed_auth("account-a", "2")
+        refreshed_a_bytes = self.application.target_auth_path.read_bytes()
+        self.application.refresh_profiles(account_b.profile_id)
+        self.application.codex_client = StubCodexClient(
+            start_error=CodexClientError("模拟启动失败")
+        )
+
+        self.application.switch_selected_profile()
+        self.wait_for_restart()
+
+        refreshed_a = next(item for item in self.application.profiles if item.remark == "账号 A")
+        self.assertEqual(
+            self.application.store.profile_path(refreshed_a).read_bytes(),
+            refreshed_a_bytes,
+        )
+        self.assertEqual(self.application.target_auth_path.read_bytes(), account_b_bytes)
+        self.assertEqual(self.notices[-1][0], "账号已切换")
+        self.assertIn("请手动启动 Codex", self.notices[-1][1])
+
+    def test_ambiguous_current_identity_stops_switch_and_restarts_original(self) -> None:
+        first_source = self.root_path / "first.json"
+        second_source = self.root_path / "second.json"
+        first_source.write_text(
+            json.dumps(self.managed_auth("account-a", "1")),
+            encoding="utf-8",
+        )
+        second_source.write_text(
+            json.dumps(self.managed_auth("account-a", "2")),
+            encoding="utf-8",
+        )
+        first = self.application.store.import_profile(first_source, "账号 A 旧副本").profile
+        legacy_source = self.root_path / "legacy.json"
+        legacy_source.write_text(json.dumps({"token": "legacy"}), encoding="utf-8")
+        second = self.application.store.import_profile(
+            legacy_source,
+            "账号 A 新副本",
+        ).profile
+        second_path = self.application.store.profile_path(second)
+        second_path.write_bytes(second_source.read_bytes())
+        manifest = json.loads(self.application.store.manifest_path.read_text(encoding="utf-8"))
+        for item in manifest["profiles"]:
+            if item["id"] == second.profile_id:
+                item["sha256"] = app_module.validate_auth_file(second_path)
+        self.application.store.manifest_path.write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+        self.write_current_managed_auth("account-a", "3")
+        current_bytes = self.application.target_auth_path.read_bytes()
+        self.application.refresh_profiles(first.profile_id)
+
+        self.application.switch_selected_profile()
+        self.wait_for_restart()
+
+        self.assertEqual(self.application.target_auth_path.read_bytes(), current_bytes)
+        self.assertEqual(self.codex_client.stop_calls, 1)
+        self.assertEqual(self.codex_client.start_calls, 1)
+        self.assertEqual(self.notices[-1][0], "切换失败")
+        self.assertIn("多个账号副本", self.notices[-1][1])
+
+    def test_manual_update_rejects_different_managed_account(self) -> None:
+        self.write_current_managed_auth("account-a", "1")
+        StubRemarkDialog.results.append("账号 A")
+        self.application.add_from_current()
+        account_a = self.application.profiles[0]
+        stored_bytes = self.application.store.profile_path(account_a).read_bytes()
+        self.write_current_managed_auth("account-b", "2")
+
+        self.application.update_selected_profile()
+
+        self.assertEqual(self.application.store.profile_path(account_a).read_bytes(), stored_bytes)
+        self.assertEqual(self.notices[-1][0], "更新失败")
+        self.assertIn("不是同一 ChatGPT 账号", self.notices[-1][1])
 
     def test_switch_error_restarts_client_with_original_auth(self) -> None:
         self.write_current_auth("saved")

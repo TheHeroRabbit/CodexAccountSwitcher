@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 
 from account_store import (
     MAX_REMARK_LENGTH,
+    SYNC_STATUS_UNMATCHED,
     AccountProfile,
     AccountStoreError,
     InvalidAuthFileError,
@@ -37,7 +38,7 @@ from provider_config import (
 )
 
 APP_TITLE = "Codex 切换器"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 SWITCH_BUTTON_TEXT = "切换账号并重启"
 PROVIDER_BUTTON_OPENAI = "切回 OpenAI 并重启"
 PROVIDER_BUTTON_DEEPSEEK = "切换到 DeepSeek 并重启"
@@ -1800,6 +1801,12 @@ class AccountSwitcherApp:
             if show_error:
                 self.show_notice("无法检测配置", self.provider_status_error, "error")
             return
+        except Exception:
+            self.provider_status_error = "系统未能检测当前模型服务。"
+            self._render_provider_status(None)
+            if show_error:
+                self.show_notice("无法检测配置", self.provider_status_error, "error")
+            return
 
         api_key = None
         self.credential_status_error = self.credential_initialization_error
@@ -2066,6 +2073,22 @@ class AccountSwitcherApp:
         self._schedule_provider_poll()
 
     def _provider_switch_worker(
+        self,
+        target_mode: str,
+        api_key: Optional[str],
+        action: str,
+    ) -> None:
+        try:
+            with self.store.codex_operation_guard(self.target_auth_path):
+                self._provider_switch_worker_locked(target_mode, api_key, action)
+        except AccountStoreError as exc:
+            self.provider_queue.put({"status": "provider_error", "message": str(exc)})
+        except Exception:
+            self.provider_queue.put(
+                {"status": "provider_error", "message": "系统未能建立模型服务切换事务。"}
+            )
+
+    def _provider_switch_worker_locked(
         self,
         target_mode: str,
         api_key: Optional[str],
@@ -2502,14 +2525,18 @@ class AccountSwitcherApp:
             self.show_notice("无法添加账号", str(exc), "error")
             return
 
-        matching = next(
-            (
-                profile
-                for profile in self.profiles
-                if profile.sha256 == source_hash and self.store.profile_is_available(profile)
-            ),
-            None,
-        )
+        matching = None
+        for profile in self.profiles:
+            path = self.store.profile_path(profile)
+            if profile.sha256 != source_hash or not path.is_file():
+                continue
+            try:
+                stored_hash = validate_auth_file(path)
+            except InvalidAuthFileError:
+                continue
+            if stored_hash == source_hash:
+                matching = profile
+                break
         if matching is not None:
             self.refresh_profiles(matching.profile_id)
             self.show_notice(
@@ -2556,7 +2583,7 @@ class AccountSwitcherApp:
         else:
             self.show_notice(
                 "账号已存在",
-                "相同的认证文件已保存为“{}”。".format(result.profile.remark),
+                "同一 ChatGPT 账号或相同认证文件已保存为“{}”。".format(result.profile.remark),
                 "info",
             )
 
@@ -2639,183 +2666,276 @@ class AccountSwitcherApp:
         client = self.codex_client
         if client is None:
             client = StoreCodexClient()
-        try:
-            provider_status = self.provider_manager.status()
-            if provider_status.conflict:
-                raise ProviderConfigError("Codex 配置已在外部修改。为避免覆盖，本次操作已取消。")
-        except (ProviderConfigError, AttributeError) as exc:
-            self.restart_queue.put(
-                {
-                    "status": "switch_error",
-                    "remark": remark,
-                    "message": str(exc) or "无法检测当前模型服务。",
-                    "client_stopped": False,
+
+        client_stopped = False
+        sync_result = None
+
+        def sync_outcome_fields():
+            if sync_result is not None and sync_result.changed and sync_result.profile is not None:
+                return {
+                    "synced_profile_id": sync_result.profile.profile_id,
+                    "synced_remark": sync_result.profile.remark,
                 }
-            )
-            return
-        provider_was_deepseek = provider_status.mode == "deepseek"
+            return {}
+
+        def restart_after_failure() -> str:
+            if not client_stopped:
+                return ""
+            try:
+                client.start()
+            except Exception:
+                return "\nCodex 未能重新启动，请手动启动。"
+            return ""
 
         try:
-            self.restart_queue.put(
-                {"status": "progress", "message": "正在关闭 Codex…", "button": "正在关闭…"}
-            )
-            stop_result = client.stop()
-        except CodexClientError as exc:
-            self.restart_queue.put(
-                {
-                    "status": "switch_error",
-                    "remark": remark,
-                    "message": str(exc),
-                    "client_stopped": False,
-                }
-            )
-            return
-        except Exception:
-            self.restart_queue.put(
-                {
-                    "status": "switch_error",
-                    "remark": remark,
-                    "message": "系统未能关闭 Codex。",
-                    "client_stopped": False,
-                }
-            )
-            return
+            with self.store.account_switch_guard(self.target_auth_path):
+                try:
+                    provider_status = self.provider_manager.status()
+                    if provider_status.conflict:
+                        raise ProviderConfigError(
+                            "Codex 配置已在外部修改。为避免覆盖，本次操作已取消。"
+                        )
+                except (ProviderConfigError, AttributeError) as exc:
+                    self.restart_queue.put(
+                        {
+                            "status": "switch_error",
+                            "remark": remark,
+                            "message": str(exc) or "无法检测当前模型服务。",
+                            "client_stopped": False,
+                        }
+                    )
+                    return
+                except Exception:
+                    self.restart_queue.put(
+                        {
+                            "status": "switch_error",
+                            "remark": remark,
+                            "message": "系统未能检测当前模型服务。",
+                            "client_stopped": False,
+                        }
+                    )
+                    return
+                provider_was_deepseek = provider_status.mode == "deepseek"
 
-        self.restart_queue.put(
-            {"status": "progress", "message": "正在更新认证文件…", "button": "正在切换…"}
-        )
-        try:
-            switch_result = self.store.switch_profile(profile_id, self.target_auth_path)
+                try:
+                    self.restart_queue.put(
+                        {
+                            "status": "progress",
+                            "message": "正在关闭 Codex…",
+                            "button": "正在关闭…",
+                        }
+                    )
+                    stop_result = client.stop()
+                    client_stopped = True
+                except CodexClientError as exc:
+                    self.restart_queue.put(
+                        {
+                            "status": "switch_error",
+                            "remark": remark,
+                            "message": str(exc),
+                            "client_stopped": False,
+                        }
+                    )
+                    return
+                except Exception:
+                    self.restart_queue.put(
+                        {
+                            "status": "switch_error",
+                            "remark": remark,
+                            "message": "系统未能关闭 Codex。",
+                            "client_stopped": False,
+                        }
+                    )
+                    return
+
+                self.restart_queue.put(
+                    {
+                        "status": "progress",
+                        "message": "正在保存当前账号的最新认证…",
+                        "button": "正在同步…",
+                    }
+                )
+                try:
+                    sync_result = self.store.sync_current_profile(self.target_auth_path)
+                except AccountStoreError as exc:
+                    self.restart_queue.put(
+                        {
+                            "status": "switch_error",
+                            "remark": remark,
+                            "message": str(exc) + restart_after_failure(),
+                            "client_stopped": True,
+                        }
+                    )
+                    return
+                except Exception:
+                    self.restart_queue.put(
+                        {
+                            "status": "switch_error",
+                            "remark": remark,
+                            "message": (
+                                "系统未能保存当前账号的最新认证。" + restart_after_failure()
+                            ),
+                            "client_stopped": True,
+                        }
+                    )
+                    return
+
+                self.restart_queue.put(
+                    {
+                        "status": "progress",
+                        "message": "正在更新认证文件…",
+                        "button": "正在切换…",
+                    }
+                )
+                try:
+                    switch_result = self.store.switch_profile(profile_id, self.target_auth_path)
+                except AccountStoreError as exc:
+                    self.restart_queue.put(
+                        {
+                            "status": "switch_error",
+                            "remark": remark,
+                            "message": str(exc) + restart_after_failure(),
+                            "client_stopped": True,
+                            **sync_outcome_fields(),
+                        }
+                    )
+                    return
+                except Exception:
+                    self.restart_queue.put(
+                        {
+                            "status": "switch_error",
+                            "remark": remark,
+                            "message": "系统未能更新认证文件。" + restart_after_failure(),
+                            "client_stopped": True,
+                            **sync_outcome_fields(),
+                        }
+                    )
+                    return
+
+                if provider_was_deepseek:
+                    self.restart_queue.put(
+                        {
+                            "status": "progress",
+                            "message": "正在恢复 OpenAI 配置…",
+                            "button": "正在切回…",
+                        }
+                    )
+                    try:
+                        self.provider_manager.restore_openai()
+                    except ProviderConfigError as exc:
+                        recovery_notes = []
+                        try:
+                            self.store.rollback_switch(switch_result)
+                        except AccountStoreError:
+                            recovery_notes.append("原认证文件未能恢复。")
+                        restart_note = restart_after_failure()
+                        if restart_note:
+                            recovery_notes.append("请手动启动 Codex。")
+                        message = str(exc)
+                        if recovery_notes:
+                            message += "\n" + " ".join(recovery_notes)
+                        self.restart_queue.put(
+                            {
+                                "status": "switch_error",
+                                "remark": remark,
+                                "message": message,
+                                "client_stopped": True,
+                                **sync_outcome_fields(),
+                            }
+                        )
+                        return
+                    except Exception:
+                        recovery_notes = []
+                        try:
+                            self.store.rollback_switch(switch_result)
+                        except AccountStoreError:
+                            recovery_notes.append("原认证文件未能恢复。")
+                        restart_note = restart_after_failure()
+                        if restart_note:
+                            recovery_notes.append("请手动启动 Codex。")
+                        message = "系统未能恢复 OpenAI 配置。"
+                        if recovery_notes:
+                            message += "\n" + " ".join(recovery_notes)
+                        self.restart_queue.put(
+                            {
+                                "status": "switch_error",
+                                "remark": remark,
+                                "message": message,
+                                "client_stopped": True,
+                                **sync_outcome_fields(),
+                            }
+                        )
+                        return
+
+                self.restart_queue.put(
+                    {"status": "progress", "message": "正在启动 Codex…", "button": "正在启动…"}
+                )
+                try:
+                    launched_pid = client.start()
+                except CodexClientError as exc:
+                    self.restart_queue.put(
+                        {
+                            "status": "restart_error",
+                            "profile_id": profile_id,
+                            "remark": remark,
+                            "changed": switch_result.changed or provider_was_deepseek,
+                            "provider_restored": provider_was_deepseek,
+                            "message": str(exc),
+                            **sync_outcome_fields(),
+                        }
+                    )
+                    return
+                except Exception:
+                    self.restart_queue.put(
+                        {
+                            "status": "restart_error",
+                            "profile_id": profile_id,
+                            "remark": remark,
+                            "changed": switch_result.changed or provider_was_deepseek,
+                            "provider_restored": provider_was_deepseek,
+                            "message": "系统未能完成 Codex 启动。",
+                            **sync_outcome_fields(),
+                        }
+                    )
+                    return
+
+                self.restart_queue.put(
+                    {
+                        "status": "success",
+                        "profile_id": profile_id,
+                        "remark": remark,
+                        "changed": switch_result.changed or provider_was_deepseek,
+                        "provider_restored": provider_was_deepseek,
+                        **sync_outcome_fields(),
+                        "unmatched_current": sync_result.status == SYNC_STATUS_UNMATCHED,
+                        "current_backup_path": switch_result.backup_path,
+                        "result": RestartResult(
+                            was_running=stop_result.was_running,
+                            forced_close=stop_result.forced_close,
+                            launched_pid=launched_pid,
+                        ),
+                    }
+                )
         except AccountStoreError as exc:
-            recovery_error = ""
-            try:
-                client.start()
-            except Exception:
-                recovery_error = "\nCodex 未能重新启动，请手动启动。"
             self.restart_queue.put(
                 {
                     "status": "switch_error",
                     "remark": remark,
-                    "message": str(exc) + recovery_error,
-                    "client_stopped": True,
+                    "message": str(exc) + restart_after_failure(),
+                    "client_stopped": client_stopped,
+                    **sync_outcome_fields(),
                 }
             )
-            return
         except Exception:
-            recovery_error = ""
-            try:
-                client.start()
-            except Exception:
-                recovery_error = "\nCodex 未能重新启动，请手动启动。"
             self.restart_queue.put(
                 {
                     "status": "switch_error",
                     "remark": remark,
-                    "message": "系统未能更新认证文件。" + recovery_error,
-                    "client_stopped": True,
+                    "message": "系统未能完成账号切换。" + restart_after_failure(),
+                    "client_stopped": client_stopped,
+                    **sync_outcome_fields(),
                 }
             )
-            return
-
-        if provider_was_deepseek:
-            self.restart_queue.put(
-                {
-                    "status": "progress",
-                    "message": "正在恢复 OpenAI 配置…",
-                    "button": "正在切回…",
-                }
-            )
-            try:
-                self.provider_manager.restore_openai()
-            except ProviderConfigError as exc:
-                recovery_notes = []
-                try:
-                    self.store.rollback_switch(switch_result)
-                except AccountStoreError:
-                    recovery_notes.append("原认证文件未能恢复。")
-                try:
-                    client.start()
-                except Exception:
-                    recovery_notes.append("请手动启动 Codex。")
-                message = str(exc)
-                if recovery_notes:
-                    message += "\n" + " ".join(recovery_notes)
-                self.restart_queue.put(
-                    {
-                        "status": "switch_error",
-                        "remark": remark,
-                        "message": message,
-                        "client_stopped": True,
-                    }
-                )
-                return
-            except Exception:
-                recovery_notes = []
-                try:
-                    self.store.rollback_switch(switch_result)
-                except AccountStoreError:
-                    recovery_notes.append("原认证文件未能恢复。")
-                try:
-                    client.start()
-                except Exception:
-                    recovery_notes.append("请手动启动 Codex。")
-                message = "系统未能恢复 OpenAI 配置。"
-                if recovery_notes:
-                    message += "\n" + " ".join(recovery_notes)
-                self.restart_queue.put(
-                    {
-                        "status": "switch_error",
-                        "remark": remark,
-                        "message": message,
-                        "client_stopped": True,
-                    }
-                )
-                return
-
-        self.restart_queue.put(
-            {"status": "progress", "message": "正在启动 Codex…", "button": "正在启动…"}
-        )
-        try:
-            launched_pid = client.start()
-        except CodexClientError as exc:
-            self.restart_queue.put(
-                {
-                    "status": "restart_error",
-                    "profile_id": profile_id,
-                    "remark": remark,
-                    "changed": switch_result.changed or provider_was_deepseek,
-                    "provider_restored": provider_was_deepseek,
-                    "message": str(exc),
-                }
-            )
-            return
-        except Exception:
-            self.restart_queue.put(
-                {
-                    "status": "restart_error",
-                    "profile_id": profile_id,
-                    "remark": remark,
-                    "changed": switch_result.changed or provider_was_deepseek,
-                    "provider_restored": provider_was_deepseek,
-                    "message": "系统未能完成 Codex 启动。",
-                }
-            )
-            return
-
-        self.restart_queue.put(
-            {
-                "status": "success",
-                "profile_id": profile_id,
-                "remark": remark,
-                "changed": switch_result.changed or provider_was_deepseek,
-                "provider_restored": provider_was_deepseek,
-                "result": RestartResult(
-                    was_running=stop_result.was_running,
-                    forced_close=stop_result.forced_close,
-                    launched_pid=launched_pid,
-                ),
-            }
-        )
 
     def _schedule_restart_poll(self) -> None:
         if self.restart_poll_id is None:
@@ -2837,18 +2957,28 @@ class AccountSwitcherApp:
             return
 
         profile_id = outcome.get("profile_id")
+        synced_profile_id = outcome.get("synced_profile_id")
         remark = outcome.get("remark", "所选账号")
         changed = outcome.get("changed", False)
         provider_restored = outcome.get("provider_restored", False)
+        synced_remark = outcome.get("synced_remark")
+        unmatched_current = outcome.get("unmatched_current", False)
+        current_backup_path = outcome.get("current_backup_path")
         self.restart_in_progress = False
         self.restart_button_text = ""
         self.switch_button.configure(text=SWITCH_BUTTON_TEXT)
         self._set_busy(False)
-        if profile_id:
-            self.refresh_profiles(profile_id)
+        refresh_profile_id = profile_id or synced_profile_id
+        if refresh_profile_id:
+            self.refresh_profiles(refresh_profile_id)
 
         if status == "switch_error":
-            self.show_notice("切换失败", outcome["message"], "error")
+            message = outcome["message"]
+            if synced_remark:
+                message += (
+                    "\n\n已自动保存“{}”由 Codex 刷新后的最新认证；目标账号切换未完成。"
+                ).format(synced_remark)
+            self.show_notice("切换失败", message, "error")
             return
 
         if status == "restart_error":
@@ -2864,6 +2994,8 @@ class AccountSwitcherApp:
                 message = ("“{}”已是当前账号。请手动启动 Codex。\n\n原因：{}").format(
                     remark, outcome["message"]
                 )
+            if synced_remark:
+                message += "\n已自动保存“{}”由 Codex 刷新后的最新认证。".format(synced_remark)
             self.show_notice(
                 title,
                 message,
@@ -2893,6 +3025,10 @@ class AccountSwitcherApp:
         else:
             title = "Codex {}".format(action)
             message = "“{}”已是当前账号。".format(remark)
+        if synced_remark:
+            message += "\n已自动保存“{}”由 Codex 刷新后的最新认证。".format(synced_remark)
+        if unmatched_current and current_backup_path is not None:
+            message += "\n原当前登录未匹配到账号列表，认证已保留在本地切换备份中。"
         self.show_notice(title, message, "success")
 
     def update_selected_profile(self) -> None:
