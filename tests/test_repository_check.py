@@ -35,6 +35,22 @@ class RepositoryCheckTests(unittest.TestCase):
             errors,
         )
 
+    def test_rejects_hard_coded_absolute_environment_path(self):
+        absolute_environment = "C:" + "\\venv\\Scripts\\python.exe\n"
+        errors = repository_check.validate_text(
+            Path("README.md"),
+            absolute_environment.encode("utf-8"),
+        )
+
+        self.assertIn("hard-coded absolute virtual environment path detected", errors)
+        self.assertEqual(
+            repository_check.validate_text(
+                Path("README.md"),
+                ".\\.venv\\Scripts\\python.exe\n".encode("utf-8"),
+            ),
+            [],
+        )
+
     def test_official_models_asset_matches_pinned_hash(self):
         self.assertEqual(repository_check.validate_models_asset(), [])
 

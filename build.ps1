@@ -1,5 +1,5 @@
 param(
-    [string]$VenvPath = "C:\venv",
+    [string]$VenvPath = "",
     [string]$PythonPath = "",
     [switch]$SkipTests,
     [switch]$SkipRepositoryCheck
@@ -11,6 +11,7 @@ Set-StrictMode -Version Latest
 $env:PYTHONUTF8 = "1"
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$setupScript = Join-Path $projectRoot "setup.ps1"
 $appName = "Codex" + [char]0x8D26 + [char]0x53F7 + [char]0x5207 + [char]0x6362 + [char]0x5668
 $appScript = Join-Path $projectRoot "app.py"
 $iconPath = Join-Path $projectRoot "assets\app_icon.ico"
@@ -23,16 +24,42 @@ $workPath = Join-Path $projectRoot "build\pyinstaller"
 $specPath = Join-Path $projectRoot "build\spec"
 
 if ([string]::IsNullOrWhiteSpace($PythonPath)) {
-    $pythonExecutable = Join-Path $VenvPath "Scripts\python.exe"
+    $usesDefaultEnvironment = [string]::IsNullOrWhiteSpace($VenvPath)
+    if ($usesDefaultEnvironment) {
+        $environmentRoot = Join-Path $projectRoot ".venv"
+    }
+    elseif ([System.IO.Path]::IsPathRooted($VenvPath)) {
+        $environmentRoot = [System.IO.Path]::GetFullPath($VenvPath)
+    }
+    else {
+        $environmentRoot = [System.IO.Path]::GetFullPath((Join-Path $projectRoot $VenvPath))
+    }
+    $pythonExecutable = Join-Path $environmentRoot "Scripts\python.exe"
+    if ($usesDefaultEnvironment -and -not (Test-Path -LiteralPath $pythonExecutable -PathType Leaf)) {
+        & $setupScript
+    }
 }
 else {
+    $environmentRoot = $null
     $pythonExecutable = $PythonPath
 }
 
 if (-not (Test-Path -LiteralPath $pythonExecutable -PathType Leaf)) {
-    throw "Python executable was not found: $pythonExecutable"
+    throw "Python executable was not found: $pythonExecutable. Run setup.ps1 or pass an explicit environment."
 }
 $pythonExecutable = (Resolve-Path -LiteralPath $pythonExecutable).Path
+
+if ($null -ne $environmentRoot) {
+    $expectedPrefix = [System.IO.Path]::GetFullPath($environmentRoot).TrimEnd("\")
+    $actualPrefix = (& $pythonExecutable -c "import sys; print(sys.prefix)").Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($actualPrefix)) {
+        throw "Unable to verify the selected Python environment."
+    }
+    $actualPrefix = [System.IO.Path]::GetFullPath($actualPrefix).TrimEnd("\")
+    if (-not $actualPrefix.Equals($expectedPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Python sys.prefix does not match the selected environment."
+    }
+}
 
 Push-Location $projectRoot
 try {

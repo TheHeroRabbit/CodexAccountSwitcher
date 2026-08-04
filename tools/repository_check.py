@@ -27,6 +27,7 @@ EXPECTED_FILES = (
     "requirements.txt",
     "requirements-build.txt",
     "requirements-dev.txt",
+    "setup.ps1",
     "version_info.txt",
 )
 EXCLUDED_DIRECTORY_NAMES = {
@@ -104,6 +105,10 @@ SECRET_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
     ("Bearer credential", re.compile(rb"Bearer[ \t]+[A-Za-z0-9._-]{20,}", re.I)),
     ("GitHub token", re.compile(rb"gh[oprsu]_[A-Za-z0-9]{20,}")),
     ("private key", re.compile(rb"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+)
+ABSOLUTE_ENVIRONMENT_PATTERN = re.compile(
+    rb"(?:^|[^A-Za-z0-9])(?:[A-Za-z]:[\\/])venv(?:[\\/]|$)",
+    re.I,
 )
 OFFICIAL_MODELS_SHA256 = "b459a6e438d6a9939d01fd0dbb4693f165ed732bc8e4fd58d7145d9d94bd49a4"
 
@@ -207,6 +212,8 @@ def validate_text(path: Path, value: bytes) -> List[str]:
         errors.append("trailing whitespace is not allowed")
     if path.suffix.casefold() == ".ps1" and any(byte > 0x7F for byte in value):
         errors.append("PowerShell scripts must remain ASCII-compatible with Windows PowerShell 5.1")
+    if ABSOLUTE_ENVIRONMENT_PATTERN.search(value):
+        errors.append("hard-coded absolute virtual environment path detected")
     for label, pattern in SECRET_PATTERNS:
         if pattern.search(value):
             errors.append("possible {} detected".format(label))

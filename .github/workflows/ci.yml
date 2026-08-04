@@ -36,24 +36,25 @@ jobs:
             requirements-build.txt
             requirements-dev.txt
 
-      - name: Install fixed development dependencies
-        run: python -m pip install -r requirements-dev.txt
+      - name: Create project environment
+        shell: pwsh
+        run: .\setup.ps1 -BasePythonPath (Get-Command python).Source
 
       - name: Run static checks
-        run: python -m ruff check .
+        run: .\.venv\Scripts\python.exe -m ruff check .
 
       - name: Verify formatting
-        run: python -m ruff format --check .
+        run: .\.venv\Scripts\python.exe -m ruff format --check .
 
       - name: Run automated tests
-        run: python -m unittest discover -s tests -v
+        run: .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 
       - name: Check repository safety and integrity
-        run: python tools/repository_check.py
+        run: .\.venv\Scripts\python.exe tools/repository_check.py
 
       - name: Build release bundle
         shell: pwsh
-        run: .\release.ps1 -PythonPath (Get-Command python).Source -SkipTests
+        run: .\release.ps1 -SkipTests
 
       - name: Test release archive
         shell: pwsh
@@ -62,7 +63,7 @@ jobs:
           if ($archive.Count -ne 1) {
               throw "Expected exactly one release ZIP."
           }
-          python -m zipfile -t $archive.FullName
+          .\.venv\Scripts\python.exe -m zipfile -t $archive.FullName
 
       - name: Upload unsigned Windows bundle
         uses: actions/upload-artifact@v4

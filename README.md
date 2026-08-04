@@ -31,16 +31,19 @@ Codex 切换器是一款仅在本机运行的 Windows 桌面工具，用于管�
 
 - Windows 10 或 Windows 11（64 位）。
 - 自动重启功能需要 Microsoft Store 版 Codex。
-- 直接运行源码或构建时需要 Python 3.8；项目默认使用 `C:\venv`，不会调用全局 Python。
+- 直接运行源码或构建时需要 Python 3.8 或更高版本。
+- 项目依赖安装在仓库根目录的 `.venv`，不会安装到全局 Python 环境。
 
 ## 快速开始
 
 ### 运行源码
 
 ```powershell
-& "C:\venv\Scripts\python.exe" -m pip install -r ".\requirements-dev.txt"
-& "C:\venv\Scripts\python.exe" ".\app.py"
+& ".\setup.ps1"
+& ".\.venv\Scripts\python.exe" ".\app.py"
 ```
+
+`setup.ps1` 使用系统已安装的 Python 3.8 创建项目内 `.venv`，随后所有依赖只安装到该目录。如需指定其他基础解释器，可传入 `-BasePythonPath`；该解释器只用于创建 `.venv`。
 
 ### 构建 EXE
 
@@ -48,7 +51,7 @@ Codex 切换器是一款仅在本机运行的 Windows 桌面工具，用于管�
 & ".\build.ps1"
 ```
 
-构建结果位于 `dist\Codex账号切换器.exe`。构建脚本会先执行仓库安全检查、图标生成和全部自动化测试。
+构建结果位于 `dist\Codex账号切换器.exe`。如果项目 `.venv` 不存在，构建脚本会先调用 `setup.ps1` 创建；随后执行仓库安全检查、图标生成和全部自动化测试。
 
 ### 创建交付包
 
@@ -61,10 +64,10 @@ Codex 切换器是一款仅在本机运行的 Windows 桌面工具，用于管�
 ## 质量检查
 
 ```powershell
-& "C:\venv\Scripts\python.exe" -m ruff check "."
-& "C:\venv\Scripts\python.exe" -m ruff format --check "."
-& "C:\venv\Scripts\python.exe" -m unittest discover -s ".\tests" -v
-& "C:\venv\Scripts\python.exe" ".\tools\repository_check.py"
+& ".\.venv\Scripts\python.exe" -m ruff check "."
+& ".\.venv\Scripts\python.exe" -m ruff format --check "."
+& ".\.venv\Scripts\python.exe" -m unittest discover -s ".\tests" -v
+& ".\.venv\Scripts\python.exe" ".\tools\repository_check.py"
 ```
 
 GitHub Actions 会在 Windows 环境中重复执行静态检查、格式检查、测试、仓库安全检查和 PyInstaller 构建。
@@ -83,6 +86,7 @@ GitHub Actions 会在 Windows 环境中重复执行静态检查、格式检查�
 ├── packaging/                # 发布包内的纯文本说明
 ├── tests/                    # 自动化测试
 ├── tools/                    # 仓库检查、视觉检查与 EXE 冒烟测试
+├── setup.ps1                 # 创建项目 .venv 并安装固定依赖
 ├── build.ps1                 # 可复现 EXE 构建
 └── release.ps1               # 可复现交付 ZIP 构建
 ```

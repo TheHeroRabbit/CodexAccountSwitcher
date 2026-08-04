@@ -4,13 +4,13 @@
 
 ## 开发环境
 
-项目主要面向 Windows 10/11，并以 Python 3.8 为兼容基线。项目维护时默认使用独立虚拟环境 `C:\venv`：
+项目主要面向 Windows 10/11，并以 Python 3.8 为兼容基线。首先在仓库根目录创建独立虚拟环境：
 
 ```powershell
-& "C:\venv\Scripts\python.exe" -m pip install -r ".\requirements-dev.txt"
+& ".\setup.ps1"
 ```
 
-如需使用其他虚拟环境，可向构建脚本传入 `-VenvPath`；CI 可使用 `-PythonPath` 指定解释器。请勿在测试、截图或文档中使用真实 `auth.json`、API Key、用户名或本机配置。
+初始化脚本只把依赖安装到项目 `.venv`。如需选择基础解释器，可传入 `-BasePythonPath`；如需使用其他已存在的虚拟环境，可向构建脚本传入 `-VenvPath` 或 `-PythonPath`。请勿在测试、截图或文档中使用真实 `auth.json`、API Key、用户名或本机配置。
 
 ## 变更原则
 
@@ -24,10 +24,10 @@
 ## 提交前检查
 
 ```powershell
-& "C:\venv\Scripts\python.exe" -m ruff check "."
-& "C:\venv\Scripts\python.exe" -m ruff format --check "."
-& "C:\venv\Scripts\python.exe" -m unittest discover -s ".\tests" -v
-& "C:\venv\Scripts\python.exe" ".\tools\repository_check.py"
+& ".\.venv\Scripts\python.exe" -m ruff check "."
+& ".\.venv\Scripts\python.exe" -m ruff format --check "."
+& ".\.venv\Scripts\python.exe" -m unittest discover -s ".\tests" -v
+& ".\.venv\Scripts\python.exe" ".\tools\repository_check.py"
 & ".\build.ps1"
 ```
 

@@ -1,5 +1,5 @@
 param(
-    [string]$VenvPath = "C:\venv",
+    [string]$VenvPath = "",
     [string]$PythonPath = "",
     [switch]$SkipTests,
     [switch]$Force
@@ -50,25 +50,37 @@ $doNotShareName = -join @(
     ".txt"
 )
 
-if ([string]::IsNullOrWhiteSpace($PythonPath)) {
-    $pythonExecutable = Join-Path $VenvPath "Scripts\python.exe"
+$buildArguments = @{}
+if (-not [string]::IsNullOrWhiteSpace($VenvPath)) {
+    $buildArguments["VenvPath"] = $VenvPath
 }
-else {
-    $pythonExecutable = $PythonPath
-}
-if (-not (Test-Path -LiteralPath $pythonExecutable -PathType Leaf)) {
-    throw "Python executable was not found: $pythonExecutable"
-}
-$pythonExecutable = (Resolve-Path -LiteralPath $pythonExecutable).Path
-
-$buildArguments = @{
-    VenvPath = $VenvPath
-    PythonPath = $pythonExecutable
+if (-not [string]::IsNullOrWhiteSpace($PythonPath)) {
+    $buildArguments["PythonPath"] = $PythonPath
 }
 if ($SkipTests) {
     $buildArguments["SkipTests"] = $true
 }
 & $buildScript @buildArguments
+
+if ([string]::IsNullOrWhiteSpace($PythonPath)) {
+    if ([string]::IsNullOrWhiteSpace($VenvPath)) {
+        $environmentRoot = Join-Path $projectRoot ".venv"
+    }
+    elseif ([System.IO.Path]::IsPathRooted($VenvPath)) {
+        $environmentRoot = [System.IO.Path]::GetFullPath($VenvPath)
+    }
+    else {
+        $environmentRoot = [System.IO.Path]::GetFullPath((Join-Path $projectRoot $VenvPath))
+    }
+    $pythonExecutable = Join-Path $environmentRoot "Scripts\python.exe"
+}
+else {
+    $pythonExecutable = $PythonPath
+}
+if (-not (Test-Path -LiteralPath $pythonExecutable -PathType Leaf)) {
+    throw "Python executable was not found after the build: $pythonExecutable"
+}
+$pythonExecutable = (Resolve-Path -LiteralPath $pythonExecutable).Path
 
 Push-Location $projectRoot
 try {
