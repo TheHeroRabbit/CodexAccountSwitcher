@@ -1,0 +1,20 @@
+* text=auto
+
+*.py text eol=lf
+*.ps1 text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+.editorconfig text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+
+*.png binary
+*.ico binary
+*.exe binary
+*.zip binary
+
+assets/deepseek_models.json linguist-vendored=true

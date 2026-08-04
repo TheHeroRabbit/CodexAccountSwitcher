@@ -1,0 +1,11 @@
+Codex 切换器 v1.3.0
+
+- 支持在 OpenAI 与 DeepSeek V4 Flash 之间安全切换。
+- DeepSeek API Key 保存到 Windows 凭据管理器，界面仅显示末四位。
+- 支持在 DeepSeek 模式下直接选择 OpenAI 账号并完成恢复、切换和重启。
+- 保护原有 Codex 配置；保留 MCP、插件和项目设置等非受管字段。
+- 检测配置冲突；写入失败时回滚配置、模型目录和认证文件。
+- 保留账号添加、更新、备注、移除、切换与 Microsoft Store 客户端自动重启。
+- 优化浅色界面、表格留白、按钮比例、对话框布局和程序图标。
+
+说明：当前自动重启仅适用于 Microsoft Store 版 Codex；本程序为非官方本地辅助工具。

@@ -1,0 +1,55 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Packaging and release outputs
+build/
+dist/
+release/
+*.spec
+/SHA256.txt
+/验收报告.txt
+
+# Runtime data and credentials
+账号文件/
+auth.json
+auth_*.json
+profiles.json
+profiles.json.bak
+provider_state.dat
+config.toml
+backup-deepseek/
+切换备份/
+更新备份/
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Generated visual QA artifacts
+/ui_*.png
+/dialog_*.png
+/notice_*.png
+/embedded_icon_*.png
+/artifacts/
+/_local_artifacts/
+/assets/app_icon_source_v*.png
+
+# Editors and operating-system files
+.idea/
+.vscode/
+*.code-workspace
+*.log
+Thumbs.db
+.DS_Store
+Desktop.ini

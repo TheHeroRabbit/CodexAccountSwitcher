@@ -1,0 +1,35 @@
+Codex 切换器 v1.3.0
+
+一、OpenAI 账号
+
+1. 打开“OpenAI 账号”。
+2. 从当前 Codex 添加账号，或手动选择 auth.json。
+3. 输入便于识别的备注。
+4. 选择账号后，可切换、更新认证、修改备注或移除。
+
+切换账号会自动关闭并重新启动 Microsoft Store 版 Codex。
+
+二、DeepSeek
+
+1. 打开“DeepSeek”。
+2. 设置 DeepSeek API Key。
+3. 点击“切换到 DeepSeek 并重启”。
+4. 如需恢复，点击“切回 OpenAI 并重启”。
+
+当前支持 DeepSeek V4 Flash。切换期间，正在运行的任务可能会中断。
+
+三、安全说明
+
+- API Key 保存在 Windows 凭据管理器，界面仅显示末四位。
+- 使用 DeepSeek 时，Codex 按官方要求从 config.toml 读取 API Key。
+- 切回 OpenAI 后，程序恢复受管字段并保留其他 Codex 设置。
+- 检测到外部配置修改时，程序停止覆盖并提示处理。
+- EXE 同级“账号文件”目录包含本机认证副本和备份，请勿上传、分享或同步。
+
+四、兼容与限制
+
+- 可读取 v1.0.x、v1.1.x 和 v1.2.x 的账号数据。
+- 自动重启仅支持 Microsoft Store 版 Codex。
+- 自动启动失败时，请按提示手动启动 Codex。
+- 本程序为非官方本地辅助工具。
+- EXE 未使用商业代码签名证书，首次运行时可能显示 Windows 安全提示。
