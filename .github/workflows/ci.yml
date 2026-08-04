@@ -66,7 +66,7 @@ jobs:
           .\.venv\Scripts\python.exe -m zipfile -t $archive.FullName
 
       - name: Upload unsigned Windows bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Codex-switcher-windows-${{ github.sha }}
           path: |
