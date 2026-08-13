@@ -96,8 +96,9 @@ try {
     }
 
     $bundleName = "$appName-v$appVersion"
+    $archiveName = "CodexAccountSwitcher-v$appVersion"
     $bundlePath = Join-Path $releaseRoot $bundleName
-    $zipPath = Join-Path $releaseRoot ($bundleName + ".zip")
+    $zipPath = Join-Path $releaseRoot ($archiveName + ".zip")
     $zipHashPath = $zipPath + ".sha256.txt"
 
     foreach ($target in @($bundlePath, $zipPath, $zipHashPath)) {

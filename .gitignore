@@ -25,6 +25,10 @@ auth_*.json
 profiles.json
 profiles.json.bak
 provider_state.dat
+.codex-account-switcher-provider-transaction.dat
+.codex-account-switcher-account-transaction.dat
+.codex-account-switcher.*.tmp
+.codex-account-switcher.*.remove
 config.toml
 backup-deepseek/
 切换备份/

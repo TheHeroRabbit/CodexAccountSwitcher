@@ -6,6 +6,23 @@
 
 - 暂无。
 
+## 1.5.0 - 2026-08-13
+
+- 在保留 `deepseek-v4-flash` 的同时，正式开放 DeepSeek 官方原生 Codex 接入模型 `deepseek-v4-pro`；DeepSeek 接入要求 Codex 0.144.0 或更高版本。
+- DeepSeek 页面增加 V4 Flash 与 V4 Pro 选择器，并分别标明“速度优先”和“能力优先”；默认仍选择 V4 Flash，当前实际生效模型会独立显示。
+- 支持从 OpenAI 直接切换到任一 DeepSeek 模型，也支持在 DeepSeek 模式下直接进行 V4 Flash 与 V4 Pro 双向切换并重启 Codex。
+- 在 DeepSeek 模式下更新 API Key 时锁定并保持当前实际模型，不会因界面中的待选项而意外切换模型。
+- 对受管的 V4 Flash 与 V4 Pro 统一设置 `model_reasoning_effort = "max"`；这是本程序的配置策略，并非 DeepSeek 官方强制要求。
+- 模型 slug 使用严格白名单校验；遇到未知或不受支持的 DeepSeek 模型时禁止继续接管，只在存在可信 OpenAI 恢复基线时允许安全切回。
+- 在 `CODEX_HOME` 增加 DPAPI 加密的全局 provider 事务日志，将恢复状态、`models.json` 和 `config.toml` 纳入可重放提交；硬退出后会区分全量完成、部分提交和第三方第三态，分别确认提交、安全回滚或失败关闭，且不覆盖较新的外部内容。
+- 在“账号文件”目录增加独立的 DPAPI 加密账号存储事务日志，把认证副本、主清单与清单备份的导入、更新、移除、重命名和修复纳入硬退出可恢复提交，并兼容收敛旧版移除墓碑。
+- provider 状态读取、激活、恢复和活动密钥读取共用可重入跨进程 Codex 锁并先处理残留日志；多点内容复检进一步缩小并发窗口，同时明确保留普通文件 API 最终 TOCTOU 的安全边界。
+- DeepSeek Windows 凭据改为按 `CODEX_HOME` 隔离；v1.4 全局凭据只由规范默认 home 验证复制并记录迁移标记，旧目标为降级兼容保留，避免 Windows 凭据管理器缺少原子比较删除时误删并行旧版本的新值；自定义 home 仅从可信活动受管配置对账。
+- 硬退出后以受管、无冲突的活动 DeepSeek `config.toml` 作为实际 API Key 权威并收敛保存凭据；OpenAI 模式下保存值继续作为下一次激活偏好。
+- 全局事务日志绑定原始 `provider_state.dat` 路径；不同便携副本共享同一 home 时，非原始副本会停止恢复并要求返回原副本处理，避免跨数据目录误恢复。
+- 保持 v1.4.0 的恢复状态指纹和默认 Flash 调用兼容；同一 DeepSeek 会话内切换模型或更新密钥不会改写原 OpenAI 恢复基线。
+- 发布 ZIP 使用 ASCII 文件名 `CodexAccountSwitcher-v1.5.0.zip`，避免上传与跨平台分发时发生文件名转换。
+
 ## 1.4.0 - 2026-08-04
 
 - 切换账号前自动保存 Codex 已刷新并回写的最新 ChatGPT 认证，避免旧 `auth.json` 快照覆盖轮换后的令牌。

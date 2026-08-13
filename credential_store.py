@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import os
 import sys
 from ctypes import wintypes
 from typing import Optional
 
 DEFAULT_CREDENTIAL_TARGET = "CodexSwitcher.DeepSeekApiKey"
+LEGACY_MIGRATION_MARKER_SUFFIX = ".LegacyMigrated.v15"
+LEGACY_MIGRATION_MARKER_VALUE = "sk-" + "migrated-v15"
 MAX_API_KEY_LENGTH = 1024
 
 
@@ -17,6 +21,75 @@ class CredentialStoreError(RuntimeError):
 
 class InvalidApiKeyError(ValueError):
     """Raised when a DeepSeek API key is not safe to place in Codex TOML."""
+
+
+def credential_target_for_codex_home(codex_home) -> str:
+    """Return a stable Credential Manager target scoped to one Codex home."""
+
+    normalized = os.path.normcase(os.path.abspath(os.fspath(codex_home)))
+    suffix = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+    return "{}.{}".format(DEFAULT_CREDENTIAL_TARGET, suffix)
+
+
+def legacy_migration_marker_target_for_codex_home(codex_home) -> str:
+    """Return the non-secret migration marker target for one Codex home."""
+
+    return credential_target_for_codex_home(codex_home) + LEGACY_MIGRATION_MARKER_SUFFIX
+
+
+def migrate_legacy_credential(
+    scoped_store,
+    legacy_store,
+    marker_store,
+    *,
+    allow_claim: bool,
+    canonical_owner: bool = False,
+    trusted_active_key: Optional[str] = None,
+) -> Optional[str]:
+    """Copy the v1.4 global credential once without racing a legacy writer.
+
+    Windows Credential Manager has no compare-and-delete primitive. The legacy
+    value is therefore retained for downgrade compatibility, while a separate
+    marker prevents a later scoped deletion from resurrecting that stale value.
+    """
+
+    scoped = scoped_store.read()
+    if trusted_active_key is not None:
+        normalize_api_key(trusted_active_key)
+    if not allow_claim or not canonical_owner:
+        return scoped
+    if marker_store is None:
+        raise CredentialStoreError("缺少旧版 DeepSeek API Key 迁移标记存储。")
+    marker = marker_store.read()
+    if marker == LEGACY_MIGRATION_MARKER_VALUE:
+        return scoped
+    if marker is not None:
+        raise CredentialStoreError("旧版 DeepSeek API Key 迁移标记无效。")
+
+    legacy = legacy_store.read()
+    if scoped is None and legacy is None:
+        return None
+
+    if scoped is None:
+        scoped_store.write(legacy)
+        if scoped_store.read() != legacy:
+            raise CredentialStoreError("无法验证迁移后的 DeepSeek API Key。")
+        scoped = legacy
+    marker_store.write(LEGACY_MIGRATION_MARKER_VALUE)
+    if marker_store.read() != LEGACY_MIGRATION_MARKER_VALUE:
+        raise CredentialStoreError("无法验证旧版 DeepSeek API Key 迁移标记。")
+    return scoped
+
+
+def reconcile_active_credential(scoped_store, active_key: str) -> str:
+    """Make the saved credential match the verified managed DeepSeek config."""
+
+    trusted = normalize_api_key(active_key)
+    if scoped_store.read() != trusted:
+        scoped_store.write(trusted)
+        if scoped_store.read() != trusted:
+            raise CredentialStoreError("无法验证活动 DeepSeek API Key 的凭据同步结果。")
+    return trusted
 
 
 def normalize_api_key(value: str) -> str:

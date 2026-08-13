@@ -13,6 +13,7 @@ from account_store import (
     SYNC_STATUS_UNSUPPORTED,
     SYNC_STATUS_UPDATED,
     AccountStoreError,
+    AccountTransactionRecoveryError,
     InvalidAuthFileError,
     ProfileStore,
     validate_auth_file,
@@ -24,6 +25,25 @@ def _hold_account_switch_lock(app_directory, target_auth_path, ready, release) -
     with store.account_switch_guard(Path(target_auth_path)):
         ready.set()
         release.wait(5.0)
+
+
+def _exit_after_auth_temp_is_synced(app_directory, profile_id, target_auth_path) -> None:
+    store = ProfileStore(Path(app_directory), lock_timeout=5.0)
+    target = Path(target_auth_path).resolve()
+    original_replace = account_store.os.replace
+
+    def exit_before_target_replace(source, destination):
+        source_path = Path(source)
+        if (
+            Path(destination).resolve() == target
+            and source_path.name.startswith(".codex-account-switcher.auth.json.")
+            and source_path.name.endswith(".tmp")
+        ):
+            os._exit(78)
+        return original_replace(source, destination)
+
+    with mock.patch("account_store.os.replace", side_effect=exit_before_target_replace):
+        store.switch_profile(profile_id, target)
 
 
 class ProfileStoreTests(unittest.TestCase):
@@ -194,6 +214,60 @@ class ProfileStoreTests(unittest.TestCase):
         self.assertFalse(second.changed)
         self.assertIsNone(second.backup_path)
         self.assertEqual(backups_before, backups_after)
+
+    def test_real_hard_exit_auth_temp_is_removed_without_touching_near_misses(self) -> None:
+        selected = self.write_json(
+            self.root / "selected.json",
+            {"token": "access-" + "orphan-account"},
+        )
+        profile = self.store.import_profile(selected, "硬退出测试账号").profile
+        target = self.write_json(
+            self.root / ".codex" / "auth.json",
+            {"token": "current-account"},
+        )
+        original = target.read_bytes()
+        context = multiprocessing.get_context("spawn")
+        process = context.Process(
+            target=_exit_after_auth_temp_is_synced,
+            args=(self.app_directory, profile.profile_id, target),
+        )
+        process.start()
+        process.join(20)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+            self.fail("account hard-exit probe did not terminate")
+        self.assertEqual(process.exitcode, 78)
+
+        owned = tuple(
+            target.parent.glob(
+                ".codex-account-switcher.auth.json.????????????????????????????????.tmp"
+            )
+        )
+        self.assertEqual(len(owned), 1)
+        secret = b"access-" + b"orphan-account"
+        self.assertIn(secret, owned[0].read_bytes())
+        near_short = target.parent / (".codex-account-switcher.auth.json." + "a" * 31 + ".tmp")
+        near_other_target = target.parent / (
+            ".codex-account-switcher.other.json." + "b" * 32 + ".tmp"
+        )
+        near_old_namespace = target.parent / (".auth.json." + "c" * 32 + ".tmp")
+        near_directory = target.parent / (".codex-account-switcher.auth.json." + "d" * 32 + ".tmp")
+        for path in (near_short, near_other_target, near_old_namespace):
+            path.write_bytes(b"keep")
+        near_directory.mkdir()
+
+        fresh = ProfileStore(self.app_directory)
+        with fresh.codex_operation_guard(target):
+            pass
+
+        self.assertFalse(owned[0].exists())
+        self.assertEqual(target.read_bytes(), original)
+        for path in (near_short, near_other_target, near_old_namespace, near_directory):
+            self.assertTrue(path.exists())
+        for path in target.parent.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(secret, path.read_bytes())
 
     def test_switch_rejects_modified_stored_profile(self) -> None:
         source = self.write_json(self.root / "auth.json", {"token": "original"})
@@ -416,6 +490,351 @@ class ProfileStoreTests(unittest.TestCase):
         self.store.remove_profile(profile.profile_id)
 
         self.assertEqual(self.store.load_profiles(), [])
+
+    def test_system_exit_after_each_changed_path_recovers_import_update_and_remove(self) -> None:
+        for operation in ("import", "update", "remove"):
+            for exit_after_call in range(1, 6):
+                with self.subTest(operation=operation, exit_after_call=exit_after_call):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        app_directory = root / "app"
+                        app_directory.mkdir()
+                        store = ProfileStore(app_directory)
+                        original = self.write_json(root / "original.json", {"token": "old-secret"})
+                        profile = store.import_profile(original, "原账号").profile
+                        stored_path = store.profile_path(profile)
+                        replacement = self.write_json(
+                            root / "replacement.json", {"token": "new-secret"}
+                        )
+                        original_guarded_replace = account_store._guarded_replace_optional
+                        calls = 0
+
+                        def exit_at_stage(path, expected, value, limit, label):
+                            nonlocal calls
+                            result = original_guarded_replace(path, expected, value, limit, label)
+                            calls += 1
+                            if calls == exit_after_call:
+                                raise SystemExit(91)
+                            return result
+
+                        with mock.patch(
+                            "account_store._guarded_replace_optional",
+                            side_effect=exit_at_stage,
+                        ):
+                            with self.assertRaises(SystemExit):
+                                if operation == "import":
+                                    store.import_profile(replacement, "新账号")
+                                elif operation == "update":
+                                    store.update_profile(profile.profile_id, replacement)
+                                else:
+                                    store.remove_profile(profile.profile_id)
+
+                        if store.account_transaction_path.exists():
+                            protected = store.account_transaction_path.read_bytes()
+                            self.assertNotIn(b"old-secret", protected)
+                            self.assertNotIn(b"new-secret", protected)
+
+                        fresh = ProfileStore(app_directory)
+                        profiles = fresh.load_profiles()
+                        committed = exit_after_call >= 4
+                        if operation == "import":
+                            self.assertEqual(len(profiles), 2 if committed else 1)
+                            if committed:
+                                imported = next(
+                                    item
+                                    for item in profiles
+                                    if item.profile_id != profile.profile_id
+                                )
+                                self.assertEqual(
+                                    fresh.profile_path(imported).read_bytes(),
+                                    replacement.read_bytes(),
+                                )
+                            else:
+                                self.assertEqual(
+                                    tuple(
+                                        path
+                                        for path in fresh.storage_directory.glob("auth_*.json")
+                                        if path != stored_path
+                                    ),
+                                    (),
+                                )
+                        elif operation == "update":
+                            self.assertEqual(len(profiles), 1)
+                            expected = replacement if committed else original
+                            self.assertEqual(stored_path.read_bytes(), expected.read_bytes())
+                            self.assertEqual(profiles[0].sha256, validate_auth_file(expected))
+                        else:
+                            self.assertEqual(len(profiles), 0 if committed else 1)
+                            self.assertEqual(stored_path.exists(), not committed)
+                        self.assertFalse(fresh.account_transaction_path.exists())
+
+    def test_disappearing_account_journal_rolls_back_owned_partial_import(self) -> None:
+        original = self.write_json(self.root / "original.json", {"token": "old-secret"})
+        self.store.import_profile(original, "原账号")
+        replacement = self.write_json(
+            self.root / "replacement.json",
+            {"token": "new-secret"},
+        )
+        original_check = self.store._account_transaction_is_current
+        calls = 0
+
+        def remove_journal_after_profile_write(expected):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                self.store.account_transaction_path.unlink()
+                return False
+            return original_check(expected)
+
+        with mock.patch.object(
+            self.store,
+            "_account_transaction_is_current",
+            side_effect=remove_journal_after_profile_write,
+        ):
+            with self.assertRaises(AccountTransactionRecoveryError):
+                self.store.import_profile(replacement, "新账号")
+
+        profiles = self.store.load_profiles()
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0].remark, "原账号")
+        self.assertEqual(len(tuple(self.store.storage_directory.glob("auth_*.json"))), 1)
+        self.assertFalse(self.store.account_transaction_path.exists())
+
+    def test_system_exit_during_recovery_is_idempotent(self) -> None:
+        source = self.write_json(self.root / "pending-import.json", {"token": "pending-secret"})
+        original_guarded_replace = account_store._guarded_replace_optional
+        calls = 0
+
+        def exit_after_profile_write(path, expected, value, limit, label):
+            nonlocal calls
+            result = original_guarded_replace(path, expected, value, limit, label)
+            calls += 1
+            if calls == 2:
+                raise SystemExit(92)
+            return result
+
+        with mock.patch(
+            "account_store._guarded_replace_optional",
+            side_effect=exit_after_profile_write,
+        ):
+            with self.assertRaises(SystemExit):
+                self.store.import_profile(source, "待恢复账号")
+
+        pending_profile = next(self.store.storage_directory.glob("auth_*.json"))
+
+        def exit_after_recovery_delete(path, expected, value, limit, label):
+            result = original_guarded_replace(path, expected, value, limit, label)
+            if Path(path) == pending_profile and value is None:
+                raise SystemExit(93)
+            return result
+
+        interrupted = ProfileStore(self.app_directory)
+        with mock.patch(
+            "account_store._guarded_replace_optional",
+            side_effect=exit_after_recovery_delete,
+        ):
+            with self.assertRaises(SystemExit):
+                interrupted.load_profiles()
+
+        self.assertTrue(interrupted.account_transaction_path.exists())
+        self.assertFalse(pending_profile.exists())
+        final = ProfileStore(self.app_directory)
+        self.assertEqual(final.load_profiles(), [])
+        self.assertFalse(final.account_transaction_path.exists())
+
+    def test_system_exit_recovers_manifest_only_rename_and_repair(self) -> None:
+        for operation in ("rename", "repair"):
+            for exit_after_call in range(1, 5):
+                with self.subTest(operation=operation, exit_after_call=exit_after_call):
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = Path(directory)
+                        app_directory = root / "app"
+                        app_directory.mkdir()
+                        store = ProfileStore(app_directory)
+                        original = self.write_json(root / "original.json", {"token": "old"})
+                        profile = store.import_profile(original, "旧备注").profile
+                        replacement = self.write_json(
+                            root / "replacement.json", {"token": "replacement"}
+                        )
+                        if operation == "repair":
+                            store.profile_path(profile).write_bytes(replacement.read_bytes())
+                        original_guarded_replace = account_store._guarded_replace_optional
+                        calls = 0
+
+                        def exit_at_stage(path, expected, value, limit, label):
+                            nonlocal calls
+                            result = original_guarded_replace(path, expected, value, limit, label)
+                            calls += 1
+                            if calls == exit_after_call:
+                                raise SystemExit(95)
+                            return result
+
+                        with mock.patch(
+                            "account_store._guarded_replace_optional",
+                            side_effect=exit_at_stage,
+                        ):
+                            with self.assertRaises(SystemExit):
+                                if operation == "rename":
+                                    store.rename_profile(profile.profile_id, "新备注")
+                                else:
+                                    store.update_profile(
+                                        profile.profile_id,
+                                        store.profile_path(profile),
+                                    )
+
+                        fresh = ProfileStore(app_directory)
+                        recovered = fresh.load_profiles()[0]
+                        committed = exit_after_call >= 3
+                        if operation == "rename":
+                            self.assertEqual(recovered.remark, "新备注" if committed else "旧备注")
+                        else:
+                            expected = replacement if committed else original
+                            self.assertEqual(recovered.sha256, validate_auth_file(expected))
+                        self.assertFalse(fresh.account_transaction_path.exists())
+
+    def test_pending_transaction_third_state_fails_closed_without_overwrite(self) -> None:
+        source = self.write_json(self.root / "pending-import.json", {"token": "journal-value"})
+        original_guarded_replace = account_store._guarded_replace_optional
+        calls = 0
+
+        def exit_after_profile_write(path, expected, value, limit, label):
+            nonlocal calls
+            result = original_guarded_replace(path, expected, value, limit, label)
+            calls += 1
+            if calls == 2:
+                raise SystemExit(94)
+            return result
+
+        with mock.patch(
+            "account_store._guarded_replace_optional",
+            side_effect=exit_after_profile_write,
+        ):
+            with self.assertRaises(SystemExit):
+                self.store.import_profile(source, "待恢复账号")
+
+        pending_profile = next(self.store.storage_directory.glob("auth_*.json"))
+        external_bytes = json.dumps({"token": "newer-external"}).encode("utf-8")
+        pending_profile.write_bytes(external_bytes)
+        fresh = ProfileStore(self.app_directory)
+
+        with self.assertRaisesRegex(AccountTransactionRecoveryError, "外部新内容"):
+            fresh.load_profiles()
+
+        self.assertEqual(pending_profile.read_bytes(), external_bytes)
+        self.assertTrue(fresh.account_transaction_path.exists())
+
+    def test_remove_failure_never_restores_over_new_external_source(self) -> None:
+        source = self.write_json(self.root / "remove.json", {"token": "original"})
+        profile = self.store.import_profile(source, "待移除账号").profile
+        stored_path = self.store.profile_path(profile)
+        external_bytes = json.dumps({"token": "newer-external"}).encode("utf-8")
+        original_guarded_replace = account_store._guarded_replace_optional
+        injected = False
+
+        def recreate_after_delete(path, expected, value, limit, label):
+            nonlocal injected
+            result = original_guarded_replace(path, expected, value, limit, label)
+            if Path(path) == stored_path and value is None and not injected:
+                injected = True
+                stored_path.write_bytes(external_bytes)
+                raise OSError("simulated failure after delete")
+            return result
+
+        with mock.patch(
+            "account_store._guarded_replace_optional",
+            side_effect=recreate_after_delete,
+        ):
+            with self.assertRaisesRegex(AccountStoreError, "保留外部内容"):
+                self.store.remove_profile(profile.profile_id)
+
+        self.assertEqual(stored_path.read_bytes(), external_bytes)
+        self.assertFalse(self.store.account_transaction_path.exists())
+        self.assertEqual(self.store.load_profiles()[0].profile_id, profile.profile_id)
+
+    def test_corrupt_or_oversized_transaction_journal_fails_closed(self) -> None:
+        self.store.ensure_storage()
+        self.store.account_transaction_path.write_bytes(
+            b'{"token":"plaintext-must-not-be-trusted"}'
+        )
+        with self.assertRaisesRegex(AccountTransactionRecoveryError, "损坏或无法解密"):
+            self.store.load_profiles()
+        self.assertTrue(self.store.account_transaction_path.exists())
+
+        self.store.account_transaction_path.unlink()
+        with self.store.account_transaction_path.open("wb") as journal:
+            journal.seek(account_store.MAX_ACCOUNT_TRANSACTION_BYTES)
+            journal.write(b"x")
+        with self.assertRaisesRegex(AccountStoreError, "过大"):
+            self.store.load_profiles()
+
+    def test_transaction_journal_rejects_a_different_storage_path(self) -> None:
+        class TestProtector:
+            prefix = b"protected-test:"
+
+            def protect(self, value):
+                return self.prefix + value
+
+            def unprotect(self, value):
+                if not value.startswith(self.prefix):
+                    raise ValueError("invalid test envelope")
+                return value[len(self.prefix) :]
+
+        protector = TestProtector()
+        store = ProfileStore(self.app_directory, protector=protector)
+        source = self.write_json(self.root / "wrong-storage.json", {"token": "secret"})
+        original_guarded_replace = account_store._guarded_replace_optional
+        calls = 0
+
+        def exit_after_journal(path, expected, value, limit, label):
+            nonlocal calls
+            result = original_guarded_replace(path, expected, value, limit, label)
+            calls += 1
+            if calls == 1:
+                raise SystemExit(96)
+            return result
+
+        with mock.patch(
+            "account_store._guarded_replace_optional",
+            side_effect=exit_after_journal,
+        ):
+            with self.assertRaises(SystemExit):
+                store.import_profile(source, "路径校验")
+
+        protected = store.account_transaction_path.read_bytes()
+        payload = json.loads(protector.unprotect(protected).decode("utf-8"))
+        payload["storage_path"] = str((self.root / "another-app" / "账号文件").resolve())
+        store.account_transaction_path.write_bytes(
+            protector.protect(
+                json.dumps(
+                    payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            )
+        )
+
+        with self.assertRaisesRegex(AccountTransactionRecoveryError, "不属于当前账号文件夹"):
+            ProfileStore(self.app_directory, protector=protector).load_profiles()
+        self.assertTrue(store.account_transaction_path.exists())
+
+    def test_legacy_remove_tombstone_is_recovered_idempotently(self) -> None:
+        source = self.write_json(self.root / "legacy-remove.json", {"token": "legacy-secret"})
+        profile = self.store.import_profile(source, "旧版移除账号").profile
+        stored_path = self.store.profile_path(profile)
+        original_bytes = stored_path.read_bytes()
+        tombstone = self.store.storage_directory / ".{}.{}.remove".format(
+            stored_path.name,
+            "a" * 32,
+        )
+        os.replace(stored_path, tombstone)
+
+        fresh = ProfileStore(self.app_directory)
+        self.assertEqual(fresh.load_profiles()[0].profile_id, profile.profile_id)
+        self.assertEqual(stored_path.read_bytes(), original_bytes)
+        self.assertFalse(tombstone.exists())
+
+        fresh.remove_profile(profile.profile_id)
+        tombstone.write_bytes(original_bytes)
+        self.assertEqual(ProfileStore(self.app_directory).load_profiles(), [])
+        self.assertFalse(tombstone.exists())
 
     def test_update_restores_a_missing_profile_file(self) -> None:
         source = self.write_json(self.root / "original.json", {"token": "old"})
@@ -734,7 +1153,7 @@ class ProfileStoreTests(unittest.TestCase):
         self.assertFalse(result.changed)
         self.assertNotEqual(self.store.profile_path(profile).read_bytes(), current.read_bytes())
 
-    def test_sync_restores_saved_copy_when_current_changes_during_copy(self) -> None:
+    def test_sync_preserves_saved_copy_when_current_changes_during_snapshot(self) -> None:
         original = self.write_json(
             self.root / "original.json",
             self.managed_auth("account-a", "1"),
@@ -746,18 +1165,18 @@ class ProfileStoreTests(unittest.TestCase):
             self.root / ".codex" / "auth.json",
             self.managed_auth("account-a", "2"),
         )
-        original_atomic_copy = account_store._atomic_copy
+        original_read_optional = account_store._read_optional_bytes
 
-        def mutate_source_before_profile_copy(source, destination, **kwargs):
-            if Path(source) == current and Path(destination) == stored_path:
+        def mutate_source_before_snapshot(path, limit, label):
+            if Path(path) == current and label == "当前认证文件":
                 self.write_json(current, self.managed_auth("account-a", "3"))
-            return original_atomic_copy(source, destination, **kwargs)
+            return original_read_optional(path, limit, label)
 
         with mock.patch(
-            "account_store._atomic_copy",
-            side_effect=mutate_source_before_profile_copy,
+            "account_store._read_optional_bytes",
+            side_effect=mutate_source_before_snapshot,
         ):
-            with self.assertRaisesRegex(AccountStoreError, "复制过程中发生变化"):
+            with self.assertRaisesRegex(AccountStoreError, "读取过程中发生变化"):
                 self.store.sync_current_profile(current)
 
         self.assertEqual(stored_path.read_bytes(), stored_bytes)
@@ -892,7 +1311,7 @@ class ProfileStoreTests(unittest.TestCase):
         external_payload = self.managed_auth("account-a", "3")
         external_bytes = json.dumps(external_payload).encode("utf-8")
 
-        def fail_manifest_after_external_change(_profiles):
+        def fail_manifest_after_external_change(_profiles, **_kwargs):
             self.write_json(stored_path, external_payload)
             raise OSError("simulated manifest failure")
 
@@ -901,7 +1320,7 @@ class ProfileStoreTests(unittest.TestCase):
             "_save_profiles",
             side_effect=fail_manifest_after_external_change,
         ):
-            with self.assertRaisesRegex(AccountStoreError, "未自动恢复"):
+            with self.assertRaisesRegex(AccountStoreError, "更新账号认证文件失败"):
                 self.store.sync_current_profile(current)
 
         self.assertEqual(stored_path.read_bytes(), external_bytes)
@@ -920,19 +1339,19 @@ class ProfileStoreTests(unittest.TestCase):
         )
         external_payload = self.managed_auth("account-a", "3")
         external_bytes = json.dumps(external_payload).encode("utf-8")
-        original_atomic_copy = account_store._atomic_copy
+        original_guarded_replace = account_store._guarded_replace_optional
 
-        def mutate_profile_after_replacement(source, destination, **kwargs):
-            result = original_atomic_copy(source, destination, **kwargs)
-            if Path(source) == current and Path(destination) == stored_path:
+        def mutate_profile_after_replacement(path, expected, replacement, limit, label):
+            result = original_guarded_replace(path, expected, replacement, limit, label)
+            if Path(path) == stored_path and replacement == current.read_bytes():
                 self.write_json(stored_path, external_payload)
             return result
 
         with mock.patch(
-            "account_store._atomic_copy",
+            "account_store._guarded_replace_optional",
             side_effect=mutate_profile_after_replacement,
         ):
-            with self.assertRaisesRegex(AccountStoreError, "未自动恢复"):
+            with self.assertRaisesRegex(AccountStoreError, "保留外部内容"):
                 self.store.sync_current_profile(current)
 
         self.assertEqual(stored_path.read_bytes(), external_bytes)

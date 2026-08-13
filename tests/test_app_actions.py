@@ -5,6 +5,7 @@ import time
 import tkinter as tk
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import app as app_module
 from codex_client import CodexClientError, RestartResult, StopResult
@@ -48,11 +49,17 @@ class StubCredentialStore:
         self.value = value
         self.writes = []
         self.delete_calls = 0
+        self.read_error = None
+        self.write_error = None
 
     def read(self):
+        if self.read_error is not None:
+            raise self.read_error
         return self.value
 
     def write(self, value):
+        if self.write_error is not None:
+            raise self.write_error
         self.value = value
         self.writes.append(value)
 
@@ -62,25 +69,46 @@ class StubCredentialStore:
 
 
 class StubProviderManager:
-    def __init__(self, mode="openai", events=None) -> None:
+    def __init__(self, mode="openai", events=None, active_model=None) -> None:
         self.mode = mode
         self.events = events if events is not None else []
         self.conflict = False
         self.activate_error = None
         self.restore_error = None
         self.last_key = None
+        self.active_model = active_model
+        self.last_model = None
+        self.managed = None
+        self.external_backup_available = False
+        self.managed_key = None
 
     def status(self):
-        return ProviderStatus(self.mode, self.mode == "deepseek", self.conflict, False)
+        active_model = self.active_model
+        if self.mode == "deepseek" and active_model is None:
+            active_model = app_module.DEEPSEEK_MODEL_FLASH
+        return ProviderStatus(
+            self.mode,
+            (
+                self.mode == "deepseek"
+                if self.managed is None
+                else self.managed and self.mode == "deepseek"
+            ),
+            self.conflict,
+            self.external_backup_available,
+            active_model,
+        )
 
-    def activate_deepseek(self, api_key):
+    def activate_deepseek(self, api_key, model_slug=app_module.DEFAULT_DEEPSEEK_MODEL):
         self.events.append("activate")
         self.last_key = api_key
+        self.last_model = model_slug
         if self.activate_error is not None:
             raise self.activate_error
-        changed = self.mode != "deepseek"
+        changed = self.mode != "deepseek" or self.active_model != model_slug
         self.mode = "deepseek"
-        return ProviderSwitchResult(changed, "deepseek")
+        self.managed = True
+        self.active_model = model_slug
+        return ProviderSwitchResult(changed, "deepseek", model_slug)
 
     def restore_openai(self):
         self.events.append("restore")
@@ -88,7 +116,12 @@ class StubProviderManager:
             raise self.restore_error
         changed = self.mode == "deepseek"
         self.mode = "openai"
-        return ProviderSwitchResult(changed, "openai")
+        self.managed = False
+        self.active_model = None
+        return ProviderSwitchResult(changed, "openai", None)
+
+    def managed_deepseek_api_key(self):
+        return self.managed_key
 
 
 class AccountSwitcherActionTests(unittest.TestCase):
@@ -123,11 +156,15 @@ class AccountSwitcherActionTests(unittest.TestCase):
         self.confirms = []
         self.application.show_confirm = self.accept_confirm
         StubRemarkDialog.results = []
+        # Drain the ttk theme-change notification queued while the interface is
+        # constructed so it cannot leak into the next short-lived test root.
+        self.root.update_idletasks()
 
     def tearDown(self) -> None:
         app_module.app_directory = self.original_app_directory
         app_module.RemarkDialog = self.original_remark_dialog
         if hasattr(self, "root"):
+            self.root.update_idletasks()
             self.root.destroy()
         self.temporary_directory.cleanup()
 
@@ -225,18 +262,310 @@ class AccountSwitcherActionTests(unittest.TestCase):
         self.wait_for_restart()
 
         self.assertEqual(self.provider_manager.mode, "deepseek")
+        self.assertEqual(self.provider_manager.last_model, app_module.DEEPSEEK_MODEL_FLASH)
         self.assertEqual(self.provider_manager.last_key, self.credential_store.value)
         self.assertEqual(self.codex_client.stop_calls, 1)
         self.assertEqual(self.codex_client.start_calls, 1)
-        self.assertEqual(self.notices[-1][0], "已切换到 DeepSeek")
+        self.assertEqual(self.notices[-1][0], "已切换到 DeepSeek V4 Flash")
 
-        self.application.toggle_provider()
+        self.application.restore_openai_provider()
         self.wait_for_restart()
 
         self.assertEqual(self.provider_manager.mode, "openai")
         self.assertEqual(self.codex_client.stop_calls, 2)
         self.assertEqual(self.codex_client.start_calls, 2)
         self.assertEqual(self.notices[-1][0], "已切回 OpenAI")
+
+    def test_selected_pro_is_passed_to_provider_and_named_in_messages(self) -> None:
+        self.application._select_deepseek_model(app_module.DEEPSEEK_MODEL_PRO)
+
+        self.application.toggle_provider()
+        self.wait_for_restart()
+
+        self.assertEqual(self.provider_manager.last_model, "deepseek-v4-pro")
+        self.assertEqual(self.provider_manager.active_model, "deepseek-v4-pro")
+        self.assertIn("V4 Pro", self.confirms[-1][0][1])
+        self.assertEqual(self.notices[-1][0], "已切换到 DeepSeek V4 Pro")
+        self.assertEqual(
+            self.application.provider_active_model_value.cget("text"),
+            "V4 Pro",
+        )
+
+    def test_openai_status_refresh_preserves_user_model_selection(self) -> None:
+        self.application._select_deepseek_model(app_module.DEEPSEEK_MODEL_PRO)
+
+        self.application.refresh_provider_status(show_error=False)
+
+        self.assertEqual(
+            self.application.selected_deepseek_model,
+            app_module.DEEPSEEK_MODEL_PRO,
+        )
+        self.assertIn("V4 Pro", self.application.provider_action_button.cget("text"))
+
+    def test_deepseek_model_switch_does_not_restore_openai(self) -> None:
+        self.provider_manager.mode = "deepseek"
+        self.provider_manager.managed = True
+        self.provider_manager.active_model = app_module.DEEPSEEK_MODEL_FLASH
+        self.application.refresh_provider_status(show_error=False)
+        self.application._select_deepseek_model(app_module.DEEPSEEK_MODEL_PRO)
+
+        self.application.toggle_provider()
+        self.wait_for_restart()
+
+        self.assertEqual(self.provider_manager.events, ["activate"])
+        self.assertEqual(self.provider_manager.active_model, app_module.DEEPSEEK_MODEL_PRO)
+        self.assertEqual(self.codex_client.stop_calls, 1)
+        self.assertEqual(self.codex_client.start_calls, 1)
+
+    def test_model_and_restore_buttons_are_wired_to_their_exact_actions(self) -> None:
+        pro_button = self.application.provider_model_buttons[app_module.DEEPSEEK_MODEL_PRO]
+        flash_button = self.application.provider_model_buttons[app_module.DEEPSEEK_MODEL_FLASH]
+        pro_button.invoke()
+        self.assertEqual(
+            self.application.selected_deepseek_model,
+            app_module.DEEPSEEK_MODEL_PRO,
+        )
+        flash_button.invoke()
+        self.assertEqual(
+            self.application.selected_deepseek_model,
+            app_module.DEEPSEEK_MODEL_FLASH,
+        )
+        pro_button.invoke()
+        self.application.provider_action_button.invoke()
+        self.wait_for_restart()
+
+        self.assertEqual(self.provider_manager.events, ["activate"])
+        self.assertEqual(self.provider_manager.last_model, app_module.DEEPSEEK_MODEL_PRO)
+
+        self.application.provider_openai_button.invoke()
+        self.wait_for_restart()
+
+        self.assertEqual(self.provider_manager.events, ["activate", "restore"])
+        self.assertEqual(self.provider_manager.mode, "openai")
+
+    def test_api_key_update_preserves_locked_active_model(self) -> None:
+        for active_model, pending_model in (
+            (app_module.DEEPSEEK_MODEL_FLASH, app_module.DEEPSEEK_MODEL_PRO),
+            (app_module.DEEPSEEK_MODEL_PRO, app_module.DEEPSEEK_MODEL_FLASH),
+        ):
+            with self.subTest(active_model=active_model):
+                self.provider_manager.mode = "deepseek"
+                self.provider_manager.managed = True
+                self.provider_manager.active_model = active_model
+                self.application.selected_deepseek_model = pending_model
+                self.credential_store.value = "sk-before-update"
+
+                self.application._begin_provider_switch(
+                    "deepseek",
+                    "sk-after-update",
+                    "update_key",
+                    target_model=pending_model,
+                    progress_button=self.application.provider_key_button,
+                )
+                self.wait_for_restart()
+
+                self.assertEqual(self.provider_manager.last_model, active_model)
+                self.assertEqual(self.provider_manager.active_model, active_model)
+                self.assertEqual(self.credential_store.value, "sk-after-update")
+                self.assertIn(
+                    app_module.DEEPSEEK_MODEL_LABELS[active_model],
+                    self.notices[-1][1],
+                )
+
+    def test_key_cas_runs_before_managed_credential_reconciliation(self) -> None:
+        active_key = "sk-active-" + "authority"
+        newer_key = "sk-other-window-" + "value"
+        self.provider_manager.mode = "deepseek"
+        self.provider_manager.managed = True
+        self.provider_manager.active_model = app_module.DEEPSEEK_MODEL_PRO
+        self.provider_manager.managed_key = active_key
+        self.credential_store.value = newer_key
+
+        self.application._begin_provider_switch(
+            "deepseek",
+            "sk-dialog-update",
+            "update_key",
+            target_model=None,
+            expected_key=active_key,
+        )
+        self.wait_for_restart()
+
+        self.assertEqual(self.credential_store.value, newer_key)
+        self.assertEqual(self.credential_store.writes, [])
+        self.assertEqual(self.provider_manager.events, [])
+        self.assertEqual(self.codex_client.stop_calls, 0)
+        self.assertIn("其他窗口发生变化", self.notices[-1][1])
+
+    def test_managed_model_switch_uses_active_config_key_as_authority(self) -> None:
+        active_key = "sk-active-" + "authority"
+        stale_saved_key = "sk-stale-saved-" + "value"
+        self.provider_manager.mode = "deepseek"
+        self.provider_manager.managed = True
+        self.provider_manager.active_model = app_module.DEEPSEEK_MODEL_FLASH
+        self.provider_manager.managed_key = active_key
+        self.credential_store.value = stale_saved_key
+
+        self.application._begin_provider_switch(
+            "deepseek",
+            stale_saved_key,
+            "switch",
+            target_model=app_module.DEEPSEEK_MODEL_PRO,
+            expected_key=stale_saved_key,
+        )
+        self.wait_for_restart()
+
+        self.assertEqual(self.provider_manager.active_model, app_module.DEEPSEEK_MODEL_PRO)
+        self.assertEqual(self.provider_manager.last_key, active_key)
+        self.assertEqual(self.credential_store.value, active_key)
+        self.assertEqual(self.credential_store.writes, [active_key])
+        self.assertEqual(self.codex_client.stop_calls, 1)
+        self.assertEqual(self.codex_client.start_calls, 1)
+
+    def test_provider_failure_preserves_newer_external_credential(self) -> None:
+        original_key = self.credential_store.value
+        replacement_key = "sk-requested-" + "replacement"
+        newer_key = "sk-other-window-" + "newer"
+
+        def fail_after_external_credential_write(_api_key, _model_slug):
+            self.credential_store.value = newer_key
+            raise ProviderConfigError("模拟配置失败")
+
+        self.provider_manager.activate_deepseek = fail_after_external_credential_write
+        self.application._begin_provider_switch(
+            "deepseek",
+            replacement_key,
+            "switch",
+            target_model=app_module.DEEPSEEK_MODEL_PRO,
+            expected_key=original_key,
+        )
+        self.wait_for_restart()
+
+        self.assertEqual(self.credential_store.value, newer_key)
+        self.assertEqual(self.credential_store.writes, [replacement_key])
+        self.assertEqual(self.codex_client.stop_calls, 1)
+        self.assertEqual(self.codex_client.start_calls, 1)
+        self.assertIn("已保留较新的凭据", self.notices[-1][1])
+
+    def test_invalid_target_mode_fails_before_stopping_codex(self) -> None:
+        self.application._begin_provider_switch("invalid", None, "switch")
+        self.wait_for_restart()
+
+        self.assertEqual(self.codex_client.stop_calls, 0)
+        self.assertEqual(self.codex_client.start_calls, 0)
+        self.assertEqual(self.provider_manager.events, [])
+        self.assertEqual(self.notices[-1][0], "切换失败")
+        self.assertIn("不支持的目标模型服务", self.notices[-1][1])
+
+    def test_restore_rechecks_locked_status_and_skips_an_external_noop(self) -> None:
+        self.provider_manager.mode = "deepseek"
+        self.provider_manager.managed = True
+        self.provider_manager.active_model = app_module.DEEPSEEK_MODEL_PRO
+        original_status = self.provider_manager.status
+
+        def status_changed_while_waiting():
+            if threading.current_thread().name == "ProviderSwitchWorker":
+                return ProviderStatus("openai", False, False, False, None)
+            return original_status()
+
+        self.provider_manager.status = status_changed_while_waiting
+        self.application.refresh_provider_status(show_error=False)
+        self.assertEqual(self.application.provider_status.mode, "deepseek")
+
+        self.application._begin_provider_switch("openai", None, "switch")
+        self.wait_for_restart()
+
+        self.assertEqual(self.codex_client.stop_calls, 0)
+        self.assertEqual(self.codex_client.start_calls, 0)
+        self.assertEqual(self.provider_manager.events, [])
+        self.assertEqual(self.notices[-1][0], "无需切换")
+
+    def test_locked_status_conflict_aborts_before_stop_or_credential_write(self) -> None:
+        original_status = self.provider_manager.status
+
+        def status_changed_while_waiting():
+            if threading.current_thread().name == "ProviderSwitchWorker":
+                return ProviderStatus(
+                    "deepseek",
+                    True,
+                    True,
+                    False,
+                    app_module.DEEPSEEK_MODEL_FLASH,
+                )
+            return original_status()
+
+        self.provider_manager.status = status_changed_while_waiting
+        self.application.refresh_provider_status(show_error=False)
+
+        self.application._begin_provider_switch(
+            "deepseek",
+            "sk-after-race",
+            "switch",
+            target_model=app_module.DEEPSEEK_MODEL_PRO,
+        )
+        self.wait_for_restart()
+
+        self.assertEqual(self.codex_client.stop_calls, 0)
+        self.assertEqual(self.credential_store.writes, [])
+        self.assertEqual(self.provider_manager.events, [])
+        self.assertIn("外部修改", self.notices[-1][1])
+
+    def test_invalid_model_fails_before_stopping_or_writing_credential(self) -> None:
+        original_key = self.credential_store.value
+
+        self.application._begin_provider_switch(
+            "deepseek",
+            "sk-invalid-model",
+            "switch",
+            target_model="deepseek-4v-pro",
+        )
+        self.wait_for_restart()
+
+        self.assertEqual(self.codex_client.stop_calls, 0)
+        self.assertEqual(self.credential_store.value, original_key)
+        self.assertEqual(self.credential_store.writes, [])
+        self.assertEqual(self.provider_manager.events, [])
+        self.assertIn("不受支持", self.notices[-1][1])
+
+    def test_unknown_active_model_disables_model_overwrite(self) -> None:
+        self.provider_manager.mode = "deepseek"
+        self.provider_manager.managed = False
+        self.provider_manager.external_backup_available = True
+        self.provider_manager.active_model = "private-deepseek"
+
+        self.application.refresh_provider_status(show_error=False)
+
+        self.assertEqual(self.application.provider_badge.cget("text"), "模型未知")
+        self.assertEqual(str(self.application.provider_action_button.cget("state")), "disabled")
+        self.assertEqual(str(self.application.provider_key_button.cget("state")), "disabled")
+        self.assertEqual(str(self.application.provider_openai_button.cget("state")), "normal")
+        for button in self.application.provider_model_buttons.values():
+            self.assertEqual(str(button.cget("state")), "disabled")
+
+    def test_managed_unknown_model_still_names_safe_openai_recovery(self) -> None:
+        self.provider_manager.mode = "deepseek"
+        self.provider_manager.managed = True
+        self.provider_manager.external_backup_available = False
+        self.provider_manager.active_model = "future-deepseek-model"
+
+        self.application.refresh_provider_status(show_error=False)
+
+        self.assertIn("只能安全切回 OpenAI", self.application.provider_hint.cget("text"))
+        self.assertEqual(str(self.application.provider_action_button.cget("state")), "disabled")
+        self.assertEqual(str(self.application.provider_openai_button.cget("state")), "normal")
+
+    def test_provider_restart_failure_keeps_selected_model_and_names_it(self) -> None:
+        self.application.codex_client = StubCodexClient(
+            start_error=CodexClientError("模拟启动失败")
+        )
+        self.application._select_deepseek_model(app_module.DEEPSEEK_MODEL_PRO)
+
+        self.application.toggle_provider()
+        self.wait_for_restart()
+
+        self.assertEqual(self.provider_manager.active_model, app_module.DEEPSEEK_MODEL_PRO)
+        self.assertEqual(self.notices[-1][0], "配置已更新")
+        self.assertIn("DeepSeek V4 Pro", self.notices[-1][1])
+        self.assertIn("请手动启动 Codex", self.notices[-1][1])
 
     def test_provider_switch_uses_the_same_cross_process_codex_lock(self) -> None:
         self.application.store.lock_timeout = 0.1
@@ -250,6 +579,42 @@ class AccountSwitcherActionTests(unittest.TestCase):
         self.assertEqual(self.provider_manager.mode, "openai")
         self.assertEqual(self.notices[-1][0], "切换失败")
         self.assertIn("Codex 操作锁", self.notices[-1][1])
+
+    def test_provider_failure_does_not_start_a_client_that_was_not_running(self) -> None:
+        self.application.codex_client = StubCodexClient(result=RestartResult(False, False, 2400))
+        self.provider_manager.activate_error = ProviderConfigError("模拟配置失败")
+
+        self.application.toggle_provider()
+        self.wait_for_restart()
+
+        self.assertEqual(self.application.codex_client.stop_calls, 1)
+        self.assertEqual(self.application.codex_client.start_calls, 0)
+        self.assertEqual(self.notices[-1][0], "切换失败")
+
+    def test_provider_guard_exit_failure_reports_committed_warning_once(self) -> None:
+        original_guard = self.application.store.codex_operation_guard
+
+        class ExitFailureGuard:
+            def __enter__(_self):
+                _self.inner = original_guard(self.application.target_auth_path)
+                return _self.inner.__enter__()
+
+            def __exit__(_self, exc_type, exc, traceback):
+                _self.inner.__exit__(exc_type, exc, traceback)
+                raise app_module.AccountStoreError("模拟锁释放失败")
+
+        self.application.store.codex_operation_guard = lambda _path: ExitFailureGuard()
+        self.application._select_deepseek_model(app_module.DEEPSEEK_MODEL_PRO)
+        self.application.toggle_provider()
+        self.wait_for_restart()
+
+        self.assertEqual(self.provider_manager.mode, "deepseek")
+        self.assertEqual(self.provider_manager.active_model, app_module.DEEPSEEK_MODEL_PRO)
+        self.assertEqual(self.codex_client.start_calls, 1)
+        self.assertEqual(self.notices[-1][0], "已切换到 DeepSeek V4 Pro")
+        self.assertEqual(self.notices[-1][2], "warning")
+        self.assertIn("配置已提交", self.notices[-1][1])
+        self.assertTrue(self.application.provider_queue.empty())
 
     def test_account_switch_from_deepseek_restores_openai_before_start(self) -> None:
         events = []
@@ -284,6 +649,69 @@ class AccountSwitcherActionTests(unittest.TestCase):
         self.assertEqual(self.provider_manager.mode, "openai")
         self.assertIn("已切回 OpenAI", self.notices[-1][1])
 
+    def test_account_switch_aborts_if_provider_changes_after_confirmation(self) -> None:
+        self.write_current_auth("saved")
+        StubRemarkDialog.results.append("工作账号")
+        self.application.add_from_current()
+        self.write_current_auth("current")
+        before = self.application.target_auth_path.read_bytes()
+        original_status = self.provider_manager.status
+
+        def status_changed_while_waiting():
+            if threading.current_thread().name == "CodexRestartWorker":
+                return ProviderStatus(
+                    "deepseek",
+                    True,
+                    False,
+                    False,
+                    app_module.DEEPSEEK_MODEL_PRO,
+                )
+            return original_status()
+
+        self.provider_manager.status = status_changed_while_waiting
+
+        self.application.switch_selected_profile()
+        self.wait_for_restart()
+
+        self.assertEqual(self.application.target_auth_path.read_bytes(), before)
+        self.assertEqual(self.codex_client.stop_calls, 0)
+        self.assertEqual(self.codex_client.start_calls, 0)
+        self.assertEqual(self.provider_manager.events, [])
+        self.assertIn("未经确认", self.notices[-1][1])
+
+    def test_account_switch_rechecks_recovery_baseline_before_stop(self) -> None:
+        self.provider_manager.mode = "deepseek"
+        self.provider_manager.managed = True
+        self.provider_manager.active_model = app_module.DEEPSEEK_MODEL_FLASH
+        self.write_current_auth("saved")
+        StubRemarkDialog.results.append("工作账号")
+        self.application.add_from_current()
+        self.write_current_auth("current")
+        before = self.application.target_auth_path.read_bytes()
+        original_status = self.provider_manager.status
+
+        def baseline_removed_while_waiting():
+            if threading.current_thread().name == "CodexRestartWorker":
+                return ProviderStatus(
+                    "deepseek",
+                    False,
+                    False,
+                    False,
+                    app_module.DEEPSEEK_MODEL_FLASH,
+                )
+            return original_status()
+
+        self.provider_manager.status = baseline_removed_while_waiting
+
+        self.application.switch_selected_profile()
+        self.wait_for_restart()
+
+        self.assertEqual(self.application.target_auth_path.read_bytes(), before)
+        self.assertEqual(self.codex_client.stop_calls, 0)
+        self.assertEqual(self.codex_client.start_calls, 0)
+        self.assertEqual(self.provider_manager.events, [])
+        self.assertIn("OpenAI 配置备份", self.notices[-1][1])
+
     def test_provider_failure_restores_previous_credential_and_restarts_client(self) -> None:
         self.provider_manager.activate_error = ProviderConfigError("模拟配置失败")
 
@@ -300,6 +728,178 @@ class AccountSwitcherActionTests(unittest.TestCase):
         self.assertEqual(self.notices[-1][0], "切换失败")
         self.assertIn("模拟配置失败", self.notices[-1][1])
 
+    def test_provider_stop_failure_leaves_key_and_model_untouched(self) -> None:
+        self.application.codex_client = StubCodexClient(stop_error=CodexClientError("模拟关闭失败"))
+        original_key = self.credential_store.value
+
+        self.application._begin_provider_switch(
+            "deepseek",
+            "sk-new-after-stop",
+            "switch",
+            target_model=app_module.DEEPSEEK_MODEL_PRO,
+        )
+        self.wait_for_restart()
+
+        self.assertEqual(self.credential_store.value, original_key)
+        self.assertEqual(self.credential_store.writes, [])
+        self.assertEqual(self.provider_manager.events, [])
+        self.assertEqual(self.provider_manager.mode, "openai")
+        self.assertEqual(self.application.codex_client.start_calls, 0)
+        self.assertIn("模拟关闭失败", self.notices[-1][1])
+
+    def test_credential_write_failure_does_not_activate_provider(self) -> None:
+        self.credential_store.write_error = app_module.CredentialStoreError("模拟凭据写入失败")
+        original_key = self.credential_store.value
+
+        self.application._begin_provider_switch(
+            "deepseek",
+            "sk-new-write-fail",
+            "switch",
+            target_model=app_module.DEEPSEEK_MODEL_PRO,
+        )
+        self.wait_for_restart()
+
+        self.assertEqual(self.provider_manager.events, [])
+        self.assertEqual(self.provider_manager.mode, "openai")
+        self.assertEqual(self.credential_store.value, original_key)
+        self.assertEqual(self.credential_store.writes, [])
+        self.assertEqual(self.codex_client.stop_calls, 1)
+        self.assertEqual(self.codex_client.start_calls, 1)
+        self.assertIn("模拟凭据写入失败", self.notices[-1][1])
+
+    def test_managed_key_reconcile_failure_is_reported_before_stop(self) -> None:
+        active_key = "sk-active-" + "authority"
+        self.provider_manager.mode = "deepseek"
+        self.provider_manager.managed = True
+        self.provider_manager.active_model = app_module.DEEPSEEK_MODEL_FLASH
+        self.provider_manager.managed_key = active_key
+        self.credential_store.value = "sk-stale-test"
+        self.credential_store.write_error = app_module.CredentialStoreError("模拟活动凭据对账失败")
+
+        self.application._begin_provider_switch(
+            "deepseek",
+            "sk-next-test",
+            "switch",
+            target_model=app_module.DEEPSEEK_MODEL_PRO,
+        )
+        self.wait_for_restart()
+
+        self.assertEqual(self.codex_client.stop_calls, 0)
+        self.assertEqual(self.codex_client.start_calls, 0)
+        self.assertEqual(self.provider_manager.events, [])
+        self.assertIn("模拟活动凭据对账失败", self.notices[-1][1])
+        self.assertNotIn(active_key, self.notices[-1][1])
+
+    def test_canonical_home_migrates_v14_credential_through_app_wiring(self) -> None:
+        legacy = StubCredentialStore("sk-legacy-test")
+        marker = StubCredentialStore(None)
+        self.credential_store.value = None
+        canonical_home = (self.root_path / ".codex").resolve()
+        self.application.codex_home = canonical_home
+        self.application.target_auth_path = canonical_home / "auth.json"
+
+        with mock.patch.object(app_module.Path, "home", return_value=self.root_path), mock.patch(
+            "app.WindowsCredentialStore", side_effect=(legacy, marker)
+        ) as store_factory:
+            self.application._migrate_and_reconcile_credentials()
+
+        self.assertEqual(
+            store_factory.call_args_list,
+            [
+                mock.call(app_module.DEFAULT_CREDENTIAL_TARGET),
+                mock.call(app_module.legacy_migration_marker_target_for_codex_home(canonical_home)),
+            ],
+        )
+        self.assertEqual(self.credential_store.value, "sk-legacy-test")
+        self.assertEqual(legacy.value, "sk-legacy-test")
+        self.assertEqual(marker.value, "sk-migrated-v15")
+
+    def test_custom_home_reconciles_managed_key_without_reading_global_legacy(self) -> None:
+        active_key = "sk-managed-" + "config"
+        self.provider_manager.mode = "deepseek"
+        self.provider_manager.managed = True
+        self.provider_manager.active_model = app_module.DEEPSEEK_MODEL_PRO
+        self.provider_manager.managed_key = active_key
+        self.credential_store.value = "sk-after-hard-exit"
+
+        with mock.patch(
+            "app.WindowsCredentialStore",
+            side_effect=AssertionError("custom homes must not read the global legacy target"),
+        ) as legacy_factory:
+            self.application._migrate_and_reconcile_credentials()
+
+        legacy_factory.assert_not_called()
+        self.assertEqual(self.credential_store.value, active_key)
+
+    def test_transient_credential_migration_failure_clears_after_refresh(self) -> None:
+        attempts = []
+        self.application.credential_migration_error = "首次迁移失败"
+
+        def retry_migration():
+            attempts.append("retry")
+
+        self.application._migrate_and_reconcile_credentials = retry_migration
+        self.application.refresh_provider_status(show_error=False)
+
+        self.assertEqual(attempts, ["retry"])
+        self.assertEqual(self.application.credential_migration_error, "")
+        self.assertEqual(self.application.credential_status_error, "")
+        self.assertEqual(str(self.application.provider_action_button.cget("state")), "normal")
+
+    def test_persistent_credential_migration_failure_remains_visible(self) -> None:
+        failure = "旧版 API Key 迁移暂未完成"
+        self.application.credential_migration_error = failure
+
+        def fail_migration():
+            raise app_module.CredentialStoreError(failure)
+
+        self.application._migrate_and_reconcile_credentials = fail_migration
+        self.application.refresh_provider_status(show_error=False)
+
+        self.assertEqual(self.application.credential_migration_error, failure)
+        self.assertEqual(self.application.credential_status_error, failure)
+        self.assertIn(failure, self.application.provider_hint.cget("text"))
+        self.assertEqual(str(self.application.provider_action_button.cget("state")), "disabled")
+
+    def test_direct_openai_restore_failure_keeps_deepseek_state(self) -> None:
+        self.provider_manager.mode = "deepseek"
+        self.provider_manager.managed = True
+        self.provider_manager.active_model = app_module.DEEPSEEK_MODEL_PRO
+        self.provider_manager.restore_error = ProviderConfigError("模拟直接恢复失败")
+        original_key = self.credential_store.value
+        self.application.refresh_provider_status(show_error=False)
+
+        self.application.provider_openai_button.invoke()
+        self.wait_for_restart()
+
+        self.assertEqual(self.provider_manager.events, ["restore"])
+        self.assertEqual(self.provider_manager.mode, "deepseek")
+        self.assertEqual(
+            self.provider_manager.active_model,
+            app_module.DEEPSEEK_MODEL_PRO,
+        )
+        self.assertEqual(self.credential_store.value, original_key)
+        self.assertEqual(self.credential_store.writes, [])
+        self.assertEqual(self.codex_client.stop_calls, 1)
+        self.assertEqual(self.codex_client.start_calls, 1)
+        self.assertIn("模拟直接恢复失败", self.notices[-1][1])
+
+    def test_unreadable_previous_key_aborts_before_stopping_codex(self) -> None:
+        self.credential_store.read_error = app_module.CredentialStoreError("模拟凭据读取失败")
+
+        self.application._begin_provider_switch(
+            "deepseek",
+            "sk-new-read-fail",
+            "switch",
+            target_model=app_module.DEEPSEEK_MODEL_PRO,
+        )
+        self.wait_for_restart()
+
+        self.assertEqual(self.codex_client.stop_calls, 0)
+        self.assertEqual(self.credential_store.writes, [])
+        self.assertEqual(self.provider_manager.events, [])
+        self.assertIn("关闭 Codex 前取消", self.notices[-1][1])
+
     def test_saved_api_key_can_be_removed_while_openai_is_active(self) -> None:
         original_dialog = app_module.ApiKeyDialog
 
@@ -313,10 +913,145 @@ class AccountSwitcherActionTests(unittest.TestCase):
             self.application.configure_deepseek_key()
         finally:
             app_module.ApiKeyDialog = original_dialog
+        self.wait_for_restart()
 
         self.assertIsNone(self.credential_store.value)
         self.assertEqual(self.credential_store.delete_calls, 1)
         self.assertEqual(self.notices[-1][0], "API Key 已移除")
+
+    def test_key_delete_aborts_if_another_instance_activates_deepseek(self) -> None:
+        original_dialog = app_module.ApiKeyDialog
+        application = self.application
+
+        class RacingDeleteDialog:
+            def __init__(self, *_args, **_kwargs):
+                application.provider_manager.mode = "deepseek"
+                application.provider_manager.active_model = app_module.DEEPSEEK_MODEL_PRO
+                self.result = None
+                self.deleted = True
+
+        app_module.ApiKeyDialog = RacingDeleteDialog
+        try:
+            self.application.configure_deepseek_key()
+        finally:
+            app_module.ApiKeyDialog = original_dialog
+        self.wait_for_restart()
+
+        self.assertEqual(self.credential_store.value, "sk-saved-test-1234")
+        self.assertEqual(self.credential_store.delete_calls, 0)
+        self.assertEqual(self.notices[-1][0], "移除失败")
+        self.assertIn("活动配置不一致", self.notices[-1][1])
+
+    def test_key_save_aborts_if_another_instance_activates_deepseek(self) -> None:
+        original_dialog = app_module.ApiKeyDialog
+        application = self.application
+
+        class RacingSaveDialog:
+            def __init__(self, *_args, **_kwargs):
+                application.provider_manager.mode = "deepseek"
+                application.provider_manager.active_model = app_module.DEEPSEEK_MODEL_FLASH
+                self.result = "sk-racing-value"
+                self.deleted = False
+
+        app_module.ApiKeyDialog = RacingSaveDialog
+        try:
+            self.application.configure_deepseek_key()
+        finally:
+            app_module.ApiKeyDialog = original_dialog
+        self.wait_for_restart()
+
+        self.assertEqual(self.credential_store.value, "sk-saved-test-1234")
+        self.assertEqual(self.credential_store.writes, [])
+        self.assertEqual(self.notices[-1][0], "保存失败")
+        self.assertIn("活动配置不一致", self.notices[-1][1])
+
+    def test_key_delete_preserves_a_newer_credential_from_another_window(self) -> None:
+        original_dialog = app_module.ApiKeyDialog
+        credential_store = self.credential_store
+
+        class RacingDeleteDialog:
+            def __init__(self, *_args, **_kwargs):
+                credential_store.value = "sk-other-window"
+                self.result = None
+                self.deleted = True
+
+        app_module.ApiKeyDialog = RacingDeleteDialog
+        try:
+            self.application.configure_deepseek_key()
+        finally:
+            app_module.ApiKeyDialog = original_dialog
+        self.wait_for_restart()
+
+        self.assertEqual(self.credential_store.value, "sk-other-window")
+        self.assertEqual(self.credential_store.delete_calls, 0)
+        self.assertEqual(self.notices[-1][0], "移除失败")
+        self.assertIn("较新的凭据", self.notices[-1][1])
+
+    def test_key_save_preserves_a_newer_credential_from_another_window(self) -> None:
+        original_dialog = app_module.ApiKeyDialog
+        credential_store = self.credential_store
+
+        class RacingSaveDialog:
+            def __init__(self, *_args, **_kwargs):
+                credential_store.value = "sk-other-window"
+                self.result = "sk-dialog-value"
+                self.deleted = False
+
+        app_module.ApiKeyDialog = RacingSaveDialog
+        try:
+            self.application.configure_deepseek_key()
+        finally:
+            app_module.ApiKeyDialog = original_dialog
+        self.wait_for_restart()
+
+        self.assertEqual(self.credential_store.value, "sk-other-window")
+        self.assertEqual(self.credential_store.writes, [])
+        self.assertEqual(self.notices[-1][0], "保存失败")
+        self.assertIn("较新的凭据", self.notices[-1][1])
+
+    def test_saved_key_mutation_uses_the_shared_codex_lock(self) -> None:
+        self.application.store.lock_timeout = 0.1
+        original_key = self.credential_store.value
+
+        with self.application.store.codex_operation_guard(self.application.target_auth_path):
+            self.application._begin_saved_key_mutation(
+                "sk-blocked-value",
+                original_key,
+            )
+            self.wait_for_restart()
+
+        self.assertEqual(self.credential_store.value, original_key)
+        self.assertEqual(self.credential_store.writes, [])
+        self.assertEqual(self.credential_store.delete_calls, 0)
+        self.assertEqual(self.notices[-1][0], "保存失败")
+        self.assertIn("Codex 操作锁", self.notices[-1][1])
+
+    def test_active_deepseek_key_update_preserves_newer_external_credential(self) -> None:
+        original_dialog = app_module.ApiKeyDialog
+        credential_store = self.credential_store
+        self.provider_manager.mode = "deepseek"
+        self.provider_manager.managed = True
+        self.provider_manager.active_model = app_module.DEEPSEEK_MODEL_PRO
+        self.application.refresh_provider_status(show_error=False)
+
+        class RacingUpdateDialog:
+            def __init__(self, *_args, **_kwargs):
+                credential_store.value = "sk-other-window"
+                self.result = "sk-dialog-value"
+                self.deleted = False
+
+        app_module.ApiKeyDialog = RacingUpdateDialog
+        try:
+            self.application.configure_deepseek_key()
+        finally:
+            app_module.ApiKeyDialog = original_dialog
+        self.wait_for_restart()
+
+        self.assertEqual(self.credential_store.value, "sk-other-window")
+        self.assertEqual(self.credential_store.writes, [])
+        self.assertEqual(self.provider_manager.events, [])
+        self.assertEqual(self.codex_client.stop_calls, 0)
+        self.assertIn("较新的凭据", self.notices[-1][1])
 
     def test_openai_restore_failure_rolls_back_account_change(self) -> None:
         self.provider_manager.mode = "deepseek"
@@ -375,6 +1110,67 @@ class AccountSwitcherActionTests(unittest.TestCase):
         self.assertEqual(self.application.target_auth_path.read_bytes(), before)
         self.assertEqual(self.notices[-1][0], "切换失败")
         self.assertIn("Codex 操作锁", self.notices[-1][1])
+
+    def test_account_failure_does_not_start_a_client_that_was_not_running(self) -> None:
+        self.write_current_auth("saved")
+        StubRemarkDialog.results.append("测试账号")
+        self.application.add_from_current()
+        self.application.codex_client = StubCodexClient(result=RestartResult(False, False, 2400))
+        self.application.store.sync_current_profile = lambda *_args, **_kwargs: (
+            _ for _ in ()
+        ).throw(app_module.AccountStoreError("模拟同步失败"))
+
+        self.application.switch_selected_profile()
+        self.wait_for_restart()
+
+        self.assertEqual(self.application.codex_client.stop_calls, 1)
+        self.assertEqual(self.application.codex_client.start_calls, 0)
+        self.assertEqual(self.notices[-1][0], "切换失败")
+
+    def test_account_guard_exit_failure_emits_only_one_terminal_outcome(self) -> None:
+        self.write_current_auth("saved")
+        StubRemarkDialog.results.append("账号 A")
+        self.application.add_from_current()
+        self.write_current_auth("target")
+        StubRemarkDialog.results.append("账号 B")
+        self.application.add_from_current()
+        target_profile = next(item for item in self.application.profiles if item.remark == "账号 A")
+        self.application.refresh_profiles(target_profile.profile_id)
+        expected_auth = self.application.store.profile_path(target_profile).read_bytes()
+        original_guard = self.application.store.account_switch_guard
+        guard_calls = 0
+
+        class ExitFailureGuard:
+            def __enter__(_self):
+                _self.inner = original_guard(self.application.target_auth_path)
+                return _self.inner.__enter__()
+
+            def __exit__(_self, exc_type, exc, traceback):
+                _self.inner.__exit__(exc_type, exc, traceback)
+                raise app_module.AccountStoreError("模拟锁释放失败")
+
+        def outer_exit_failure_guard(_path):
+            nonlocal guard_calls
+            guard_calls += 1
+            if guard_calls == 1:
+                return ExitFailureGuard()
+            return original_guard(self.application.target_auth_path)
+
+        self.application.store.account_switch_guard = outer_exit_failure_guard
+        self.application.switch_selected_profile()
+        self.wait_for_restart()
+
+        self.assertEqual(self.application.target_auth_path.read_bytes(), expected_auth)
+        self.assertEqual(self.notices[-1][0], "已切换账号")
+        self.assertEqual(self.notices[-1][2], "warning")
+        self.assertIn("模拟锁释放失败", self.notices[-1][1])
+        terminal_items = []
+        while not self.application.restart_queue.empty():
+            item = self.application.restart_queue.get_nowait()
+            if item.get("status") != "progress":
+                terminal_items.append(item)
+        self.assertEqual(terminal_items, [])
+        self.assertEqual(self.application.codex_client.start_calls, 1)
 
     def test_unexpected_provider_status_failure_finishes_without_stopping_codex(self) -> None:
         self.write_current_auth("saved")
@@ -832,8 +1628,11 @@ class AccountSwitcherActionTests(unittest.TestCase):
         self.root.update()
 
         self.assertTrue(self.application.provider_action_button.winfo_ismapped())
+        self.assertTrue(self.application.provider_openai_button.winfo_ismapped())
         self.assertTrue(self.application.provider_key_button.winfo_ismapped())
         self.assertTrue(self.application.provider_refresh_button.winfo_ismapped())
+        for button in self.application.provider_model_buttons.values():
+            self.assertTrue(button.winfo_ismapped())
         action_bottom = (
             self.application.provider_key_button.winfo_rooty()
             + self.application.provider_key_button.winfo_height()

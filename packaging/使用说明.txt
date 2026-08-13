@@ -1,4 +1,4 @@
-Codex 切换器 v1.4.0
+Codex 切换器 v1.5.0
 
 一、OpenAI 账号
 
@@ -13,27 +13,41 @@ Codex 切换器 v1.4.0
 
 账号存储和完整切换会通过本机锁文件跨进程串行执行；账号切换与模型服务切换共用同一 Codex 操作锁。如果另一个实例正在切换，当前操作会等待或在停止 Codex、修改文件前安全退出。同步成功但后续切换失败时，界面会刷新已保存的当前账号并明确提示部分结果。
 
+认证副本、账号清单和清单备份的变更使用“账号文件”目录中的 DPAPI 加密事务日志。程序硬退出后，下次打开会先确认完整提交或安全恢复部分写入；出现第三方内容时不会覆盖。不要手动删除该日志。
+
 二、DeepSeek
 
 1. 打开“DeepSeek”。
-2. 设置 DeepSeek API Key。
-3. 点击“切换到 DeepSeek 并重启”。
-4. 如需恢复，点击“切回 OpenAI 并重启”。
+2. 选择“V4 Flash · 速度优先”或“V4 Pro · 能力优先”。
+3. 设置 DeepSeek API Key。
+4. 点击对应的“切换到 V4 Flash/V4 Pro 并重启”。
+5. 如需恢复，点击“切回 OpenAI 并重启”。
 
-当前支持 DeepSeek V4 Flash。切换期间，正在运行的任务可能会中断。
+当前支持精确模型 deepseek-v4-flash 和 deepseek-v4-pro，DeepSeek 接入要求 Codex 0.144.0 或更高版本。从 OpenAI 进入时默认选择 V4 Flash；已经使用 DeepSeek 时，可以选择另一个模型直接双向切换。切换期间，正在运行的任务可能会中断。
+
+本程序接管 Flash 或 Pro 时统一设置 model_reasoning_effort = "max"。这是本程序的配置策略，不是 DeepSeek 官方强制要求；切回 OpenAI 时会恢复进入 DeepSeek 前的对应设置。
+
+“所选模型”只决定下一次切换，“当前模型”才是实际生效模型。在 DeepSeek 模式下更新 API Key 会保持当前实际模型并重启 Codex，不会应用尚未确认的另一个模型选项。
 
 三、安全说明
 
-- API Key 保存在 Windows 凭据管理器，界面仅显示末四位。
+- API Key 保存在按 CODEX_HOME 隔离的 Windows 凭据目标中，界面仅显示末四位。v1.4 全局凭据只由默认 %USERPROFILE%\.codex 验证复制并写迁移标记；旧目标为降级兼容保留，标记会阻止重复导入。自定义 home 不读取或认领该全局值，只能从可信的活动受管配置对账。
 - 使用 DeepSeek 时，Codex 按官方要求从 config.toml 读取 API Key。
+- 恢复状态、models.json 和 config.toml 使用预期旧内容比较更新；CODEX_HOME 中的 DPAPI 加密全局事务日志还能处理进程硬退出。所有目标已完成时确认提交，部分完成时安全回滚，出现第三方第三态时停止恢复、保留日志且不覆盖外部内容。
+- 账号副本/清单、当前 auth.json、provider 配置、Windows 凭据和 Codex 进程是独立恢复边界，不构成操作系统级单一事务。若硬退出停在边界之间，重新打开后按界面真实状态重试账号或服务切换，必要时手动启动 Codex。
+- 硬退出后，受管且无冲突的活动 DeepSeek config.toml 是实际 API Key 的对账权威；OpenAI 模式下保存的凭据只是下一次切换偏好。
 - 切回 OpenAI 后，程序恢复受管字段并保留其他 Codex 设置。
 - 检测到外部配置修改时，程序停止覆盖并提示处理。
+- 跨进程锁和写入前后多点复检只能协调本程序实例；普通文件 API 仍有很小的最终 TOCTOU 窗口，因此切换时不要同时使用第三方工具修改相关文件。
 - EXE 同级“账号文件”目录包含本机认证副本和备份，请勿上传、分享或同步。
 - 自动同步只保存 Codex 已完成的令牌刷新，不会解码、使用、显示或把令牌值写入日志，也不会自行调用 OAuth 刷新接口。
 
 四、兼容与限制
 
-- 可读取 v1.0.x 至 v1.3.x 的账号数据；旧格式仍可添加和切换。缺少可验证身份的旧 ChatGPT 记录不能用变化后的 ChatGPT/API Key 认证覆盖，请移除旧记录并从当前 Codex 重新添加。
+- 可读取 v1.0.x 至 v1.4.x 的账号数据；旧格式仍可添加和切换。缺少可验证身份的旧 ChatGPT 记录不能用变化后的 ChatGPT/API Key 认证覆盖，请移除旧记录并从当前 Codex 重新添加。
+- 当前 DeepSeek 模型未知或不受支持时，程序不会猜测或覆盖，也不允许切换模型或更新密钥；只有存在可信 OpenAI 备份时才能安全切回。
+- 如果事务日志提示属于另一份程序数据目录，请先退出所有实例并备份 CODEX_HOME 及相关“账号文件”目录，再返回创建日志的原始便携副本完成恢复。不要手动删除 .codex-account-switcher-provider-transaction.dat 或 provider_state.dat；原副本丢失时请保留现场并通过仓库私密安全公告联系维护者。
+- 如果账号目录中的 .codex-account-switcher-account-transaction.dat 损坏或路径不匹配，同样先备份原“账号文件”目录并返回创建日志的便携副本，禁止手动删除清单、认证副本或日志。
 - 自动同步要求 Codex 将认证写回 .codex\auth.json；只使用操作系统凭据存储时，未写入该文件的更新无法同步。
 - 自动重启仅支持 Microsoft Store 版 Codex。
 - 自动启动失败时，请按提示手动启动 Codex。

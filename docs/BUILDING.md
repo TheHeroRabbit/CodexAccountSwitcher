@@ -71,7 +71,7 @@ CodexAccountSwitcher/
 - 是否重新引入固定磁盘位置的虚拟环境路径。
 - 文本是否为 UTF-8、LF、无 BOM、无行尾空格并以换行结束。
 - 是否出现疑似 API Key、Bearer Token、GitHub Token 或私钥头。
-- 官方 `deepseek_models.json` 的 SHA-256、JSON 结构和必要模型元数据。
+- 官方 `deepseek_models.json` 的 SHA-256、JSON 结构，以及 `deepseek-v4-flash`、`deepseek-v4-pro` 两个开放模型的必要元数据。
 
 检查不会输出检测到的疑似密钥值。
 
@@ -119,17 +119,19 @@ CodexAccountSwitcher/
 
 ```text
 release/
-├── Codex账号切换器-v1.4.0/
+├── Codex账号切换器-v1.5.0/
 │   ├── Codex账号切换器.exe
 │   ├── SHA256.txt
 │   ├── 使用说明.txt
 │   ├── 更新说明.txt
 │   └── 账号文件/请勿分享此文件夹.txt
-├── Codex账号切换器-v1.4.0.zip
-└── Codex账号切换器-v1.4.0.zip.sha256.txt
+├── CodexAccountSwitcher-v1.5.0.zip
+└── CodexAccountSwitcher-v1.5.0.zip.sha256.txt
 ```
 
-脚本默认拒绝覆盖同名发布结果。确认目标确实是本项目 `release\` 后，可使用 `-Force` 重建。
+发布目录保留中文产品名，便于 Windows 用户识别；ZIP 和 ZIP 校验文件固定使用 ASCII 名，作为 GitHub Release 与跨平台传输时的规范资产名。校验文件中的 ZIP 文件名必须与实际 ASCII 资产名一致。
+
+脚本默认拒绝覆盖同名发布结果。确认目标确实是本项目 `release\` 后，可使用 `-Force` 重建。正式发布不得复用旧版本 EXE、ZIP、校验值或验收记录；任何代码、模型目录、说明或打包脚本变化后都必须重新执行完整构建与成品检查。
 
 ## 6. EXE 冒烟测试
 

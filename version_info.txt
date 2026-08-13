@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 4, 0, 0),
-    prodvers=(1, 4, 0, 0),
+    filevers=(1, 5, 0, 0),
+    prodvers=(1, 5, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
         [
           StringStruct(u'CompanyName', u'\u672c\u5730\u5de5\u5177'),
           StringStruct(u'FileDescription', u'Codex\u8d26\u53f7\u4e0e\u6a21\u578b\u670d\u52a1\u5207\u6362\u5de5\u5177'),
-          StringStruct(u'FileVersion', u'1.4.0'),
+          StringStruct(u'FileVersion', u'1.5.0'),
           StringStruct(u'InternalName', u'CodexAccountSwitcher'),
           StringStruct(u'LegalCopyright', u'\u4ec5\u4f9b\u672c\u5730\u4f7f\u7528'),
           StringStruct(u'OriginalFilename', u'Codex\u8d26\u53f7\u5207\u6362\u5668.exe'),
           StringStruct(u'ProductName', u'Codex\u5207\u6362\u5668'),
-          StringStruct(u'ProductVersion', u'1.4.0'),
+          StringStruct(u'ProductVersion', u'1.5.0'),
           StringStruct(u'Comments', u'\u975e\u5b98\u65b9\u672c\u5730\u8d26\u53f7\u4e0e\u6a21\u578b\u670d\u52a1\u5207\u6362\u8f85\u52a9\u5de5\u5177')
         ]
       )

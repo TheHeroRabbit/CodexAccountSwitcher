@@ -12,10 +12,12 @@ Codex 切换器是一款仅在本机运行的 Windows 桌面工具，用于管�
 - 切换前自动保存 Codex 已刷新并回写的最新 ChatGPT 认证，避免恢复过期快照。
 - 更新认证副本、修改备注、移除账号并保留必要备份。
 - 切换 OpenAI 账号后自动重启 Microsoft Store 版 Codex。
-- 切换到 DeepSeek V4 Flash，并精确恢复切换前的 OpenAI 配置。
+- 选择 DeepSeek V4 Flash 或 V4 Pro，并精确恢复切换前的 OpenAI 配置。
+- 在 DeepSeek 模式下直接进行 V4 Flash 与 V4 Pro 双向切换；更新 API Key 时保持当前实际模型。
+- 本程序接管 Flash 或 Pro 时统一设置 `model_reasoning_effort = "max"`；这是本程序的运行策略，不是 DeepSeek 官方对该字段的强制要求。
 - DeepSeek 模式下可直接切换 OpenAI 账号，一次完成服务恢复、账号替换和客户端重启。
 - 检测受管配置的外部修改；存在冲突时停止覆盖。
-- 配置写入失败时回滚 `config.toml`、`models.json` 和账号认证文件。
+- 通过两套 DPAPI 加密的持久事务日志处理 provider 多文件配置与账号副本/清单的普通失败和进程硬退出；只恢复仍能证明属于本次事务的内容。
 
 ## 安全设计
 
@@ -23,13 +25,17 @@ Codex 切换器是一款仅在本机运行的 Windows 桌面工具，用于管�
 - ChatGPT 账号只通过 `auth_mode` 与 `tokens.account_id` 的不可逆内存指纹匹配；账号 ID、邮箱和令牌不会写入账号清单、日志或界面。
 - 自动同步只在 Codex 已停止、账号唯一匹配且原副本哈希可信时执行；保存前再次比较预期旧哈希，身份重复、错配、并发更新或外部修改都会停止覆盖。
 - 账号存储以及账号/模型服务完整切换事务使用进程内可重入锁与跨进程锁文件串行化，避免多个程序实例交叉停止客户端或互相覆盖；锁等待超时会在停止 Codex 和修改文件前安全退出。
-- DeepSeek API Key 保存在 Windows 凭据管理器，界面只显示末四位。
-- 模型服务恢复状态使用当前 Windows 用户的 DPAPI 加密。
-- 配置和认证文件采用临时文件、落盘同步和原子替换。
+- DeepSeek 模型仅接受 `deepseek-v4-flash` 与 `deepseek-v4-pro` 两个官方 slug；恢复状态、模型目录和配置文件使用预期旧值比较更新，失败回滚前也会确认目标仍是本次写入内容。
+- DeepSeek API Key 保存在按 `CODEX_HOME` 隔离的 Windows 凭据目标中，界面只显示末四位；v1.4 的全局凭据只由规范的默认 `%USERPROFILE%\.codex` 复制并用独立迁移标记防止重复导入。旧目标为兼容降级而保留，自定义 home 不会读取或认领它。
+- 模型服务恢复状态、位于 `CODEX_HOME` 的全局 `.codex-account-switcher-provider-transaction.dat`，以及“账号文件”目录中的 `.codex-account-switcher-account-transaction.dat` 均使用当前 Windows 用户的 DPAPI 加密。
+- 每次读取状态、激活或恢复前都会先处理残留事务日志：所有目标都已是新内容时确认提交，只有部分目标写入时回滚，出现既非事务前也非事务后内容时停止自动恢复且绝不覆盖该外部内容。
+- 配置和认证文件采用应用专属临时文件、落盘同步和原子替换；下次取得相应锁时会清理严格匹配的孤儿临时文件。
 - 仓库检查会拒绝认证文件、私钥、疑似 API Key、运行时数据和构建产物。
 - 发布包不会包含本机账号数据、Codex 配置或 Windows 凭据。
 
-使用 DeepSeek 期间，Codex 会按官方配置要求从 `%USERPROFILE%\.codex\config.toml` 读取 API Key；切回 OpenAI 后，本程序会移除受管的 DeepSeek 配置并恢复原状态。
+使用 DeepSeek 期间，Codex 会按官方配置要求从当前 `CODEX_HOME\config.toml` 读取 API Key；同一 DeepSeek 会话内切换模型或更新密钥会保留最初的 OpenAI 恢复基线，切回 OpenAI 后，本程序会移除受管的 DeepSeek 配置并恢复原状态。若进程硬退出后保存凭据与活动受管配置不一致，活动受管 `config.toml` 中经过校验的 API Key 是实际运行值和对账权威；OpenAI 模式下保存的凭据只是下一次切换使用的偏好值。
+
+账号副本/清单事务、当前 `auth.json` 替换、provider 配置和 Codex 进程控制属于不同存储或进程边界，不冒充操作系统级单一原子事务。程序会按已完成阶段恢复或确认提交；若恰好在这些边界之间被强制终止，重新打开后会先收敛各自日志，界面按磁盘真实状态显示，必要时可重新执行目标账号切换或安全切回 OpenAI。此时不要手动删除事务日志。
 
 ChatGPT 登录令牌的获取、刷新和失效判断仍完全由 Codex 官方客户端负责。本程序不调用私有 OAuth 接口，也不硬编码刷新周期；它只在下一次账号切换覆盖 `auth.json` 之前，保存 Codex 已经写回的最新文件。
 
@@ -37,6 +43,7 @@ ChatGPT 登录令牌的获取、刷新和失效判断仍完全由 Codex 官方�
 
 - Windows 10 或 Windows 11（64 位）。
 - 自动重启功能需要 Microsoft Store 版 Codex。
+- DeepSeek V4 Flash / V4 Pro 接入需要 Codex 0.144.0 或更高版本。
 - 直接运行源码或构建时需要 Python 3.8 或更高版本。
 - 项目依赖安装在仓库根目录的 `.venv`，不会安装到全局 Python 环境。
 
@@ -65,7 +72,7 @@ ChatGPT 登录令牌的获取、刷新和失效判断仍完全由 Codex 官方�
 & ".\release.ps1"
 ```
 
-发布脚本会生成带使用说明和 SHA-256 校验文件的 ZIP，输出到 `release\`。已有同名输出不会被覆盖；确认需要替换时显式传入 `-Force`。
+发布脚本会生成带使用说明和 SHA-256 校验文件的 ASCII 命名 ZIP，例如 `release\CodexAccountSwitcher-v1.5.0.zip`。已有同名输出不会被覆盖；确认需要替换时显式传入 `-Force`。
 
 ## 质量检查
 
@@ -83,7 +90,7 @@ GitHub Actions 会在 Windows 环境中重复执行静态检查、格式检查�
 ```text
 .
 ├── app.py                    # Tkinter 界面与交互编排
-├── account_store.py          # 账号认证存储与事务回滚
+├── account_store.py          # 账号认证存储、DPAPI 持久日志与事务恢复
 ├── codex_client.py           # Microsoft Store Codex 重启边界
 ├── credential_store.py       # Windows 凭据管理器与 DPAPI
 ├── provider_config.py        # OpenAI / DeepSeek 配置事务
@@ -104,8 +111,9 @@ GitHub Actions 会在 Windows 环境中重复执行静态检查、格式检查�
 - 自动同步以 Codex 实际写回 `.codex/auth.json` 为前提；若 Codex 被配置为只把凭据保存在操作系统凭据存储中，本程序无法同步未出现在该文件里的更新。
 - 自动同步不能保证永久免登录。刷新令牌被撤销、真正过期，或受到 MFA、密码、安全设置及组织策略影响时，Codex 仍可能要求重新登录。
 - 如果旧版本已经保存了同一 ChatGPT 身份的多个副本，程序会停止自动覆盖并要求先保留正确记录，避免把最新令牌写错账号项。
-- 跨进程锁用于协调本工具的实例；其他程序不会自动遵守该锁。切换期间应避免用第三方工具同时修改 `auth.json` 或账号目录。程序会在判断、备份和写入后多次校验哈希，但独立锁文件不是对任意外部写入的内核级强制锁。
-- 本版本的 DeepSeek 页面仅开放已经完成配置事务、失败回滚、界面与发布物端到端验收的 `deepseek-v4-flash`。仓库中包含的其他模型元数据不代表本版本已经承诺支持；扩展开放范围前需要单独完成兼容性与回滚验收。
+- 跨进程锁用于协调本工具的实例；其他程序不会自动遵守该锁。切换期间应避免用第三方工具同时修改 `auth.json`、`config.toml`、`models.json` 或账号目录。程序会在判断、备份、写入和恢复阶段多次校验内容，但普通文件 API 无法提供真正的跨文件原子比较交换，最后一次校验与替换之间仍存在很小的 TOCTOU 竞争窗口；发现无法证明归属的内容时程序会失败关闭而不是强行覆盖。
+- DeepSeek 页面只开放官方精确 slug `deepseek-v4-flash` 与 `deepseek-v4-pro`，默认选择 V4 Flash。当前配置为未知或不受支持的 DeepSeek 模型时，程序不会猜测或覆盖；只有存在可信 OpenAI 恢复基线时才允许安全切回。
+- 全局事务日志会记录创建事务时使用的 `provider_state.dat` 路径。若另一个便携副本使用同一 `CODEX_HOME` 打开它，程序会停止自动恢复；请先备份当前 `.codex` 和两个程序数据目录，返回创建该日志的原始便携副本完成恢复。不要手动删除日志或 `provider_state.dat`；无法确认原始副本时请保留现场并通过私密安全渠道联系支持。
 - 发布的 EXE 未使用商业代码签名证书，Windows 首次运行时可能显示安全提示。
 - 本项目不会联网验证 API Key；真实调用可能产生费用，由用户自行确认。
 

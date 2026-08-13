@@ -67,6 +67,8 @@ FORBIDDEN_FILE_NAMES = {
     "profiles.json",
     "profiles.json.bak",
     "provider_state.dat",
+    ".codex-account-switcher-provider-transaction.dat",
+    ".codex-account-switcher-account-transaction.dat",
     "sha256.txt",
     "验收报告.txt",
 }
@@ -78,6 +80,8 @@ FORBIDDEN_FILE_PATTERNS = (
     "*.pfx",
     "*.pyc",
     "*.spec",
+    ".codex-account-switcher.*.tmp",
+    ".codex-account-switcher.*.remove",
 )
 ROOT_GENERATED_IMAGE_PATTERNS = (
     "dialog_*.png",
@@ -111,6 +115,8 @@ ABSOLUTE_ENVIRONMENT_PATTERN = re.compile(
     re.I,
 )
 OFFICIAL_MODELS_SHA256 = "b459a6e438d6a9939d01fd0dbb4693f165ed732bc8e4fd58d7145d9d94bd49a4"
+REQUIRED_DEEPSEEK_MODELS = frozenset({"deepseek-v4-flash", "deepseek-v4-pro"})
+VERSION_PATTERN = re.compile(r'^APP_VERSION = "(\d+)\.(\d+)\.(\d+)"$', re.M)
 
 
 def _repository_relative(path: Path) -> str:
@@ -220,25 +226,127 @@ def validate_text(path: Path, value: bytes) -> List[str]:
     return errors
 
 
-def validate_models_asset() -> List[str]:
+def validate_models_payload(value: bytes) -> List[str]:
     errors = []
+    try:
+        payload = json.loads(value.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        errors.append("assets/deepseek_models.json is invalid: {}".format(exc))
+        return errors
+    if not isinstance(payload, dict) or not isinstance(payload.get("models"), list):
+        return ["assets/deepseek_models.json must contain a models array"]
+    slugs = {
+        item.get("slug")
+        for item in payload["models"]
+        if isinstance(item, dict) and isinstance(item.get("slug"), str)
+    }
+    missing = sorted(REQUIRED_DEEPSEEK_MODELS.difference(slugs))
+    if missing:
+        errors.append(
+            "assets/deepseek_models.json is missing required model metadata: {}".format(
+                ", ".join(missing)
+            )
+        )
+    return errors
+
+
+def validate_models_asset() -> List[str]:
     path = PROJECT_ROOT / "assets" / "deepseek_models.json"
     try:
         value = path.read_bytes()
     except OSError as exc:
         return ["unable to read assets/deepseek_models.json: {}".format(exc)]
+    errors = []
     digest = hashlib.sha256(value).hexdigest()
     if digest != OFFICIAL_MODELS_SHA256:
         errors.append("assets/deepseek_models.json hash does not match the pinned official asset")
-    try:
-        payload = json.loads(value.decode("utf-8"))
-        slugs = {item.get("slug") for item in payload.get("models", []) if isinstance(item, dict)}
-    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError) as exc:
-        errors.append("assets/deepseek_models.json is invalid: {}".format(exc))
-    else:
-        required = {"deepseek-v4-flash", "deepseek-v4-pro"}
-        if not required.issubset(slugs):
-            errors.append("assets/deepseek_models.json is missing required model metadata")
+    errors.extend(validate_models_payload(value))
+    return errors
+
+
+def validate_version_alignment(project_root: Path = PROJECT_ROOT) -> List[str]:
+    """Keep user-facing, executable, and release versions on one contract."""
+
+    required_text = (
+        "app.py",
+        "version_info.txt",
+        "CHANGELOG.md",
+        "SECURITY.md",
+        "README.md",
+        "docs/BUILDING.md",
+        "docs/VERIFICATION.md",
+        "packaging/使用说明.txt",
+        "packaging/更新说明.txt",
+    )
+    values = {}
+    errors = []
+    for relative in required_text:
+        path = project_root / relative
+        try:
+            values[relative] = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            errors.append("{}: unable to read version source: {}".format(relative, exc))
+    if errors:
+        return errors
+
+    match = VERSION_PATTERN.search(values["app.py"])
+    if match is None:
+        return ["app.py: APP_VERSION is missing or invalid"]
+    parts = tuple(int(item) for item in match.groups())
+    version = ".".join(str(item) for item in parts)
+    maintenance = "{}.{}.x".format(parts[0], parts[1])
+    tuple_value = "({}, {}, {}, 0)".format(*parts)
+    archive_name = "CodexAccountSwitcher-v{}.zip".format(version)
+
+    expected_fragments = (
+        ("version_info.txt", "filevers={}".format(tuple_value)),
+        ("version_info.txt", "prodvers={}".format(tuple_value)),
+        ("version_info.txt", "FileVersion', u'{}'".format(version)),
+        ("version_info.txt", "ProductVersion', u'{}'".format(version)),
+        ("CHANGELOG.md", "## {} -".format(version)),
+        ("SECURITY.md", "`{}`".format(maintenance)),
+        ("README.md", archive_name),
+        ("docs/BUILDING.md", archive_name),
+        ("docs/VERIFICATION.md", "# v{} ".format(version)),
+        ("docs/VERIFICATION.md", "本记录对应当前工作区的 v{} ".format(version)),
+        (
+            "docs/VERIFICATION.md",
+            "release\\Codex账号切换器-v{}".format(version),
+        ),
+        ("docs/VERIFICATION.md", archive_name),
+        ("docs/VERIFICATION.md", "- FileVersion：{}。".format(version)),
+        ("docs/VERIFICATION.md", "- ProductVersion：{}。".format(version)),
+        ("packaging/使用说明.txt", "Codex 切换器 v{}".format(version)),
+        ("packaging/更新说明.txt", "Codex 切换器 v{}".format(version)),
+    )
+    for relative, fragment in expected_fragments:
+        if fragment not in values[relative]:
+            errors.append(
+                "{}: version contract does not match app.py {}".format(
+                    relative,
+                    version,
+                )
+            )
+
+    verification = values["docs/VERIFICATION.md"]
+    explicit_version_patterns = (
+        r"^# v(?P<version>\d+\.\d+\.\d+) ",
+        r"^本记录对应当前工作区的 v(?P<version>\d+\.\d+\.\d+) ",
+        r"^- FileVersion：(?P<version>\d+\.\d+\.\d+)。$",
+        r"^- ProductVersion：(?P<version>\d+\.\d+\.\d+)。$",
+        r"^- 发布目录：`release\\Codex账号切换器-v(?P<version>\d+\.\d+\.\d+)`。$",
+        r"^- 发布包：`release\\CodexAccountSwitcher-v(?P<version>\d+\.\d+\.\d+)\.zip`。$",
+    )
+    for pattern in explicit_version_patterns:
+        matches = tuple(
+            item.group("version") for item in re.finditer(pattern, verification, re.MULTILINE)
+        )
+        if matches != (version,):
+            errors.append(
+                "docs/VERIFICATION.md: explicit version evidence does not match app.py {}".format(
+                    version
+                )
+            )
     return errors
 
 
@@ -272,6 +380,7 @@ def validate_repository(paths: Iterable[Path]) -> List[str]:
         if expected not in relative_paths:
             errors.append("required repository file is missing: {}".format(expected))
     errors.extend(validate_models_asset())
+    errors.extend(validate_version_alignment())
     return errors
 
 

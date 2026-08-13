@@ -50,7 +50,7 @@ def main() -> None:
     schedule_capture(root, notice_path)
     app_module.NoticeDialog(
         root,
-        "已切换到 DeepSeek",
+        "已切换到 DeepSeek V4 Pro",
         "Codex 已重新启动。",
         font_family,
         "success",
@@ -60,8 +60,8 @@ def main() -> None:
     schedule_capture(root, confirm_path)
     app_module.ConfirmDialog(
         root,
-        "切换到 DeepSeek",
-        "将切换到 DeepSeek V4 Flash，并重启 Codex。\n正在运行的任务可能会中断。",
+        "切换 DeepSeek 模型",
+        "将切换到 DeepSeek V4 Pro，并重启 Codex。\n正在运行的任务可能会中断。",
         font_family,
         "切换并重启",
     )
@@ -71,7 +71,7 @@ def main() -> None:
     app_module.NoticeDialog(
         root,
         "配置已更新",
-        "已切换到 DeepSeek，但 Codex 未能自动启动。\n"
+        "已切换到 DeepSeek V4 Pro，但 Codex 未能自动启动。\n"
         "请手动启动 Codex。\n\n"
         "原因：未检测到 Microsoft Store 版 Codex。",
         font_family,

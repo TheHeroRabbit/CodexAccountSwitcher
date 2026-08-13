@@ -18,8 +18,9 @@ import app as app_module
 
 
 class SmokeProviderManager:
-    def __init__(self, mode="openai") -> None:
+    def __init__(self, mode="openai", active_model=None) -> None:
         self.mode = mode
+        self.active_model = active_model
 
     def status(self):
         return app_module.ProviderStatus(
@@ -27,6 +28,7 @@ class SmokeProviderManager:
             self.mode == "deepseek",
             False,
             False,
+            self.active_model if self.mode == "deepseek" else None,
         )
 
 
@@ -48,6 +50,11 @@ def main() -> None:
     parser.add_argument("--progress", action="store_true")
     parser.add_argument("--page", choices=("accounts", "deepseek"), default="accounts")
     parser.add_argument(
+        "--model",
+        choices=(app_module.DEEPSEEK_MODEL_FLASH, app_module.DEEPSEEK_MODEL_PRO),
+        default=app_module.DEEPSEEK_MODEL_FLASH,
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=PROJECT_ROOT / "artifacts" / "ui-smoke.png",
@@ -64,7 +71,8 @@ def main() -> None:
 
         root = app_module.tk.Tk()
         provider_manager = SmokeProviderManager(
-            "deepseek" if arguments.page == "deepseek" else "openai"
+            "deepseek" if arguments.page == "deepseek" else "openai",
+            arguments.model if arguments.page == "deepseek" else None,
         )
         application = app_module.AccountSwitcherApp(
             root,

@@ -20,17 +20,27 @@ from account_store import (
     AccountStoreError,
     InvalidAuthFileError,
     ProfileStore,
+    codex_operation_guard_for_home,
     validate_auth_file,
 )
 from codex_client import CodexClientError, RestartResult, StoreCodexClient
 from credential_store import (
+    DEFAULT_CREDENTIAL_TARGET,
     CredentialStoreError,
     InvalidApiKeyError,
     WindowsCredentialStore,
+    credential_target_for_codex_home,
+    legacy_migration_marker_target_for_codex_home,
     masked_api_key,
+    migrate_legacy_credential,
     normalize_api_key,
+    reconcile_active_credential,
 )
 from provider_config import (
+    DEEPSEEK_MODEL_FLASH,
+    DEEPSEEK_MODEL_PRO,
+    DEFAULT_DEEPSEEK_MODEL,
+    SUPPORTED_DEEPSEEK_MODELS,
     ProviderConfigError,
     ProviderConfigManager,
     ProviderStatus,
@@ -38,10 +48,20 @@ from provider_config import (
 )
 
 APP_TITLE = "Codex 切换器"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 SWITCH_BUTTON_TEXT = "切换账号并重启"
 PROVIDER_BUTTON_OPENAI = "切回 OpenAI 并重启"
-PROVIDER_BUTTON_DEEPSEEK = "切换到 DeepSeek 并重启"
+PROVIDER_BUTTON_DEEPSEEK = "应用所选模型并重启"
+
+DEEPSEEK_MODEL_LABELS = {
+    DEEPSEEK_MODEL_FLASH: "V4 Flash",
+    DEEPSEEK_MODEL_PRO: "V4 Pro",
+}
+DEEPSEEK_MODEL_TITLES = {
+    DEEPSEEK_MODEL_FLASH: "DeepSeek V4 Flash",
+    DEEPSEEK_MODEL_PRO: "DeepSeek V4 Pro",
+}
+_KEY_EXPECTATION_UNSET = object()
 
 SPACE_XS = 4
 SPACE_SM = 8
@@ -890,12 +910,14 @@ class AccountSwitcherApp:
         self.provider_status = ProviderStatus("openai", False, False, False)
         self.provider_status_error = ""
         self.credential_status_error = ""
+        self.selected_deepseek_model = DEFAULT_DEEPSEEK_MODEL
         self.busy = False
         self.busy_message = ""
         self.restart_in_progress = False
         self.restart_button_text = ""
         self.provider_in_progress = False
         self.provider_button_text = ""
+        self.provider_progress_button: Optional[FlatButton] = None
         self.codex_client = codex_client
         self.restart_queue = queue.Queue()
         self.restart_poll_id = None
@@ -907,8 +929,10 @@ class AccountSwitcherApp:
 
         self.provider_manager = provider_manager
         self.credential_store = credential_store
+        credential_store_was_injected = credential_store is not None
         self.provider_initialization_error = ""
         self.credential_initialization_error = ""
+        self.credential_migration_error = ""
         if self.provider_manager is None:
             try:
                 self.provider_manager = ProviderConfigManager(
@@ -920,9 +944,20 @@ class AccountSwitcherApp:
                 self.provider_initialization_error = str(exc)
         if self.credential_store is None:
             try:
-                self.credential_store = WindowsCredentialStore()
+                self.credential_store = WindowsCredentialStore(
+                    credential_target_for_codex_home(self.codex_home)
+                )
             except (CredentialStoreError, OSError) as exc:
                 self.credential_initialization_error = str(exc)
+        if (
+            not credential_store_was_injected
+            and self.provider_manager is not None
+            and self.credential_store is not None
+        ):
+            try:
+                self._migrate_and_reconcile_credentials()
+            except (AccountStoreError, ProviderConfigError, CredentialStoreError, OSError) as exc:
+                self.credential_migration_error = str(exc)
 
         self._configure_window()
         self._configure_styles()
@@ -1509,7 +1544,7 @@ class AccountSwitcherApp:
             column=1,
             sticky="nsew",
             padx=SPACE_2XL,
-            pady=SPACE_XL,
+            pady=SPACE_LG,
         )
 
         provider_top = tk.Frame(provider_body, bg=COLORS["surface"])
@@ -1532,28 +1567,59 @@ class AccountSwitcherApp:
         )
         self.provider_badge.pack(side="right")
 
-        tk.Label(
+        self.provider_model_title = tk.Label(
             provider_body,
-            text="DeepSeek V4 Flash",
+            text=DEEPSEEK_MODEL_TITLES[self.selected_deepseek_model],
             font=(self.font_family, 20, "bold"),
             fg=COLORS["text"],
             bg=COLORS["surface"],
             anchor="w",
-        ).pack(fill="x", pady=(SPACE_MD, 4))
+        )
+        self.provider_model_title.pack(fill="x", pady=(SPACE_XS, 2))
         tk.Label(
             provider_body,
-            text="通过 DeepSeek Responses API 使用 Codex。",
+            text="通过 DeepSeek 原生 Responses API 使用 Codex。",
             font=(self.font_family, 9),
             fg=COLORS["muted"],
             bg=COLORS["surface"],
             anchor="w",
         ).pack(fill="x")
 
+        model_selector = tk.Frame(provider_body, bg=COLORS["surface"])
+        model_selector.pack(fill="x", pady=(SPACE_XS, 0))
+        model_options = tk.Frame(model_selector, bg=COLORS["surface"])
+        model_options.pack(fill="x")
+        model_options.grid_columnconfigure(0, weight=1, uniform="deepseek-model")
+        model_options.grid_columnconfigure(1, weight=1, uniform="deepseek-model")
+        self.provider_model_buttons = {}
+        for column, (model_slug, button_text) in enumerate(
+            (
+                (DEEPSEEK_MODEL_FLASH, "V4 Flash · 速度优先"),
+                (DEEPSEEK_MODEL_PRO, "V4 Pro · 能力优先"),
+            )
+        ):
+            button = FlatButton(
+                model_options,
+                text=button_text,
+                command=lambda value=model_slug: self._select_deepseek_model(value),
+                font_family=self.font_family,
+                variant="ghost",
+                compact=True,
+            )
+            button.grid(
+                row=0,
+                column=column,
+                sticky="ew",
+                padx=(0, SPACE_XS) if column == 0 else (SPACE_XS, 0),
+            )
+            self.provider_model_buttons[model_slug] = button
+
         provider_metadata = tk.Frame(provider_body, bg=COLORS["surface_alt"])
-        provider_metadata.pack(fill="x", pady=(SPACE_XL, SPACE_MD))
+        provider_metadata.pack(fill="x", pady=(SPACE_MD, SPACE_SM))
         provider_metadata.grid_columnconfigure(1, weight=1)
 
-        for row, label_text in enumerate(("当前模式", "API Key", "配置状态")):
+        metadata_labels = ("当前服务", "当前模型", "API Key", "配置状态")
+        for row, label_text in enumerate(metadata_labels):
             tk.Label(
                 provider_metadata,
                 text=label_text,
@@ -1566,7 +1632,7 @@ class AccountSwitcherApp:
                 column=0,
                 sticky="w",
                 padx=(SPACE_MD, SPACE_SM),
-                pady=(SPACE_SM if row == 0 else SPACE_XS, SPACE_SM if row == 2 else SPACE_XS),
+                pady=SPACE_XS,
             )
 
         self.provider_mode_value = tk.Label(
@@ -1582,7 +1648,22 @@ class AccountSwitcherApp:
             column=1,
             sticky="e",
             padx=(SPACE_SM, SPACE_MD),
-            pady=(SPACE_SM, SPACE_XS),
+            pady=SPACE_XS,
+        )
+        self.provider_active_model_value = tk.Label(
+            provider_metadata,
+            text="—",
+            font=(self.font_family, 9, "bold"),
+            fg=COLORS["text"],
+            bg=COLORS["surface_alt"],
+            anchor="e",
+        )
+        self.provider_active_model_value.grid(
+            row=1,
+            column=1,
+            sticky="e",
+            padx=(SPACE_SM, SPACE_MD),
+            pady=SPACE_XS,
         )
         self.provider_key_value = tk.Label(
             provider_metadata,
@@ -1593,7 +1674,7 @@ class AccountSwitcherApp:
             anchor="e",
         )
         self.provider_key_value.grid(
-            row=1,
+            row=2,
             column=1,
             sticky="e",
             padx=(SPACE_SM, SPACE_MD),
@@ -1608,11 +1689,11 @@ class AccountSwitcherApp:
             anchor="e",
         )
         self.provider_config_value.grid(
-            row=2,
+            row=3,
             column=1,
             sticky="e",
             padx=(SPACE_SM, SPACE_MD),
-            pady=(SPACE_XS, SPACE_SM),
+            pady=SPACE_XS,
         )
 
         self.provider_hint = tk.Label(
@@ -1625,10 +1706,12 @@ class AccountSwitcherApp:
             anchor="w",
             wraplength=470,
         )
-        self.provider_hint.pack(fill="x", pady=(0, SPACE_MD))
+        self.provider_hint.pack(fill="x", pady=(0, SPACE_SM))
 
         provider_actions = tk.Frame(provider_body, bg=COLORS["surface"])
         provider_actions.pack(fill="x", side="bottom")
+        provider_actions.grid_columnconfigure(0, weight=1, uniform="provider-action")
+        provider_actions.grid_columnconfigure(1, weight=1, uniform="provider-action")
         self.provider_action_button = FlatButton(
             provider_actions,
             text=PROVIDER_BUTTON_DEEPSEEK,
@@ -1636,7 +1719,21 @@ class AccountSwitcherApp:
             font_family=self.font_family,
             variant="primary",
         )
-        self.provider_action_button.pack(fill="x")
+        self.provider_action_button.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.provider_openai_button = FlatButton(
+            provider_actions,
+            text=PROVIDER_BUTTON_OPENAI,
+            command=self.restore_openai_provider,
+            font_family=self.font_family,
+            variant="secondary",
+        )
+        self.provider_openai_button.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            padx=(0, SPACE_XS),
+            pady=(SPACE_SM, 0),
+        )
         self.provider_key_button = FlatButton(
             provider_actions,
             text="设置 API Key",
@@ -1644,7 +1741,13 @@ class AccountSwitcherApp:
             font_family=self.font_family,
             variant="secondary",
         )
-        self.provider_key_button.pack(fill="x", pady=(SPACE_SM, 0))
+        self.provider_key_button.grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=(SPACE_XS, 0),
+            pady=(SPACE_SM, 0),
+        )
 
         guide_card = card_frame(self.deepseek_page)
         guide_card.grid(row=0, column=1, sticky="nsew")
@@ -1704,13 +1807,15 @@ class AccountSwitcherApp:
             fg=COLORS["primary"],
             bg=COLORS["primary_soft"],
         ).pack(anchor="w", padx=SPACE_MD, pady=(SPACE_SM, 2))
-        tk.Label(
+        self.provider_supported_models = tk.Label(
             support_note,
-            text="DeepSeek V4 Flash",
+            text="V4 Flash · V4 Pro\nCodex 0.144.0+",
             font=(self.font_family, 9, "bold"),
             fg=COLORS["text"],
             bg=COLORS["primary_soft"],
-        ).pack(anchor="w", padx=SPACE_MD, pady=(0, SPACE_SM))
+            justify="left",
+        )
+        self.provider_supported_models.pack(anchor="w", padx=SPACE_MD, pady=(0, SPACE_SM))
 
         self.provider_refresh_button = FlatButton(
             guide_body,
@@ -1722,6 +1827,9 @@ class AccountSwitcherApp:
         )
         self.provider_refresh_button.pack(side="bottom", fill="x", pady=(SPACE_LG, 0))
         self.provider_action_button.set_enabled(False)
+        self.provider_openai_button.set_enabled(False)
+        for button in self.provider_model_buttons.values():
+            button.set_enabled(False)
         self.deepseek_page.grid_remove()
 
         footer = tk.Frame(outer, bg=COLORS["window"])
@@ -1777,6 +1885,31 @@ class AccountSwitcherApp:
         self.refresh_profiles()
         self.refresh_provider_status(show_error=False)
 
+    def _migrate_and_reconcile_credentials(self) -> None:
+        """Upgrade v1.4 credentials and converge them with a managed active config."""
+
+        with codex_operation_guard_for_home(self.codex_home, timeout=0.25):
+            status = self.provider_manager.status()
+            trusted_active_key = None
+            if status.mode == "deepseek" and status.managed and not status.conflict:
+                trusted_active_key = self.provider_manager.managed_deepseek_api_key()
+            canonical_home = (Path.home() / ".codex").resolve()
+            if self.codex_home == canonical_home:
+                legacy_store = WindowsCredentialStore(DEFAULT_CREDENTIAL_TARGET)
+                marker_store = WindowsCredentialStore(
+                    legacy_migration_marker_target_for_codex_home(self.codex_home)
+                )
+                migrate_legacy_credential(
+                    self.credential_store,
+                    legacy_store,
+                    marker_store,
+                    allow_claim=True,
+                    canonical_owner=True,
+                    trusted_active_key=trusted_active_key,
+                )
+            if trusted_active_key is not None:
+                reconcile_active_credential(self.credential_store, trusted_active_key)
+
     def _read_api_key(self) -> Optional[str]:
         if self.credential_store is None:
             raise CredentialStoreError(
@@ -1784,12 +1917,111 @@ class AccountSwitcherApp:
             )
         return self.credential_store.read()
 
-    def refresh_provider_status(self, show_error: bool = False) -> None:
+    def _mutate_saved_deepseek_key_while_openai(
+        self,
+        value: Optional[str],
+        expected_key: Optional[str],
+    ) -> None:
+        """Change the saved key only if OpenAI is still active under the shared lock."""
+
+        if self.provider_manager is None:
+            raise ProviderConfigError("模型服务配置组件不可用。")
+        if self.credential_store is None:
+            raise CredentialStoreError("凭据管理器不可用。")
+        with self.store.codex_operation_guard(self.target_auth_path):
+            locked_status = self.provider_manager.status()
+            if locked_status.mode != "openai":
+                raise ProviderConfigError(
+                    "当前模型服务已在其他窗口切换为 DeepSeek。"
+                    "为避免 API Key 与活动配置不一致，本次操作已取消，请刷新后重试。"
+                )
+            locked_key = self.credential_store.read()
+            if locked_key != expected_key:
+                raise CredentialStoreError(
+                    "DeepSeek API Key 已在其他窗口发生变化。"
+                    "为避免覆盖较新的凭据，本次操作已取消，请刷新后重试。"
+                )
+            if value is None:
+                self.credential_store.delete()
+            else:
+                self.credential_store.write(value)
+
+    def _begin_saved_key_mutation(
+        self,
+        value: Optional[str],
+        expected_key: Optional[str],
+    ) -> None:
+        deleting = value is None
+        self._set_provider_progress(
+            "正在移除…" if deleting else "正在保存…",
+            "正在移除 API Key…" if deleting else "正在保存 API Key…",
+            progress_button=self.provider_key_button,
+        )
+        worker = threading.Thread(
+            target=self._saved_key_mutation_worker,
+            args=(value, expected_key),
+            name="CredentialMutationWorker",
+            daemon=False,
+        )
+        worker.start()
+        self._schedule_provider_poll()
+
+    def _saved_key_mutation_worker(
+        self,
+        value: Optional[str],
+        expected_key: Optional[str],
+    ) -> None:
+        deleting = value is None
+        try:
+            self._mutate_saved_deepseek_key_while_openai(value, expected_key)
+        except (AccountStoreError, ProviderConfigError, CredentialStoreError) as exc:
+            self.provider_queue.put(
+                {
+                    "status": "credential_error",
+                    "action": "delete" if deleting else "save",
+                    "message": str(exc),
+                }
+            )
+            return
+        except Exception:
+            self.provider_queue.put(
+                {
+                    "status": "credential_error",
+                    "action": "delete" if deleting else "save",
+                    "message": "系统未能更新 DeepSeek API Key。",
+                }
+            )
+            return
+        self.provider_queue.put(
+            {
+                "status": "credential_success",
+                "action": "delete" if deleting else "save",
+            }
+        )
+
+    def _select_deepseek_model(self, model_slug: str) -> None:
+        if self.busy or model_slug not in SUPPORTED_DEEPSEEK_MODELS:
+            return
+        self.selected_deepseek_model = model_slug
+        self.refresh_provider_status(show_error=False, sync_selection=False)
+
+    def refresh_provider_status(
+        self,
+        show_error: bool = False,
+        sync_selection: bool = True,
+    ) -> None:
+        if self.credential_migration_error and not self.busy:
+            try:
+                self._migrate_and_reconcile_credentials()
+            except (AccountStoreError, ProviderConfigError, CredentialStoreError, OSError) as exc:
+                self.credential_migration_error = str(exc)
+            else:
+                self.credential_migration_error = ""
         if self.provider_manager is None:
             self.provider_status_error = (
                 self.provider_initialization_error or "DeepSeek 配置组件不可用。"
             )
-            self._render_provider_status(None)
+            self._render_provider_status(None, sync_selection=False)
             if show_error:
                 self.show_notice("无法检测配置", self.provider_status_error, "error")
             return
@@ -1797,31 +2029,52 @@ class AccountSwitcherApp:
             status = self.provider_manager.status()
         except (ProviderConfigError, OSError) as exc:
             self.provider_status_error = str(exc)
-            self._render_provider_status(None)
+            self._render_provider_status(None, sync_selection=False)
             if show_error:
                 self.show_notice("无法检测配置", self.provider_status_error, "error")
             return
         except Exception:
             self.provider_status_error = "系统未能检测当前模型服务。"
-            self._render_provider_status(None)
+            self._render_provider_status(None, sync_selection=False)
             if show_error:
                 self.show_notice("无法检测配置", self.provider_status_error, "error")
             return
 
         api_key = None
-        self.credential_status_error = self.credential_initialization_error
+        self.credential_status_error = (
+            self.credential_initialization_error or self.credential_migration_error
+        )
         if self.credential_store is not None:
             try:
                 api_key = self._read_api_key()
             except CredentialStoreError as exc:
                 self.credential_status_error = str(exc)
+            else:
+                if not self.credential_initialization_error and not self.credential_migration_error:
+                    self.credential_status_error = ""
 
         self.provider_status = status
         self.provider_status_error = ""
-        self._render_provider_status(api_key)
+        self._render_provider_status(api_key, sync_selection=sync_selection)
         self._render_selection()
 
-    def _render_provider_status(self, api_key: Optional[str]) -> None:
+    def _render_provider_status(
+        self,
+        api_key: Optional[str],
+        sync_selection: bool = True,
+    ) -> None:
+        is_deepseek = self.provider_status.mode == "deepseek"
+        active_model = self.provider_status.active_model
+        active_model_supported = active_model in SUPPORTED_DEEPSEEK_MODELS
+        if sync_selection and is_deepseek and active_model_supported:
+            self.selected_deepseek_model = active_model
+        selected_label = DEEPSEEK_MODEL_LABELS[self.selected_deepseek_model]
+        self.provider_model_title.configure(
+            text=DEEPSEEK_MODEL_TITLES[self.selected_deepseek_model]
+        )
+        for model_slug, button in self.provider_model_buttons.items():
+            button.set_selected(model_slug == self.selected_deepseek_model)
+
         if self.provider_status_error:
             self.provider_badge.configure(
                 text="配置异常",
@@ -1829,6 +2082,7 @@ class AccountSwitcherApp:
                 bg=COLORS["danger_soft"],
             )
             self.provider_mode_value.configure(text="—", fg=COLORS["text"])
+            self.provider_active_model_value.configure(text="—", fg=COLORS["text"])
             self.provider_key_value.configure(text="—", fg=COLORS["text"])
             self.provider_config_value.configure(
                 text="需要处理",
@@ -1838,15 +2092,28 @@ class AccountSwitcherApp:
                 text=self.provider_status_error,
                 fg=COLORS["danger"],
             )
+            self.provider_action_button.configure(text="应用所选模型并重启")
             self.provider_action_button.set_enabled(False)
+            self.provider_openai_button.set_enabled(False)
             self.provider_key_button.set_enabled(False)
+            self.provider_refresh_button.set_enabled(not self.busy)
+            for button in self.provider_model_buttons.values():
+                button.set_enabled(False)
             return
 
-        is_deepseek = self.provider_status.mode == "deepseek"
         self.provider_mode_value.configure(
             text="DeepSeek" if is_deepseek else "OpenAI",
             fg=COLORS["teal"] if is_deepseek else COLORS["primary"],
         )
+        if is_deepseek:
+            self.provider_active_model_value.configure(
+                text=(
+                    DEEPSEEK_MODEL_LABELS[active_model] if active_model_supported else "未知或缺失"
+                ),
+                fg=COLORS["teal"] if active_model_supported else COLORS["danger"],
+            )
+        else:
+            self.provider_active_model_value.configure(text="—", fg=COLORS["muted"])
         if self.credential_status_error:
             self.provider_key_value.configure(
                 text="需要更新",
@@ -1858,43 +2125,60 @@ class AccountSwitcherApp:
                 fg=COLORS["success"] if api_key else COLORS["muted"],
             )
 
+        safe_recovery = self.provider_status.managed or (
+            is_deepseek and self.provider_status.external_backup_available
+        )
         if self.provider_status.conflict:
             badge_text = "配置已变更"
             badge_fg = COLORS["danger"]
             badge_bg = COLORS["danger_soft"]
             config_text = "需要确认"
             hint = "检测到外部修改。为避免覆盖，请先恢复或重新配置。"
-            action_enabled = False
+            provider_safe = False
+        elif is_deepseek and not active_model_supported:
+            badge_text = "模型未知"
+            badge_fg = COLORS["danger"]
+            badge_bg = COLORS["danger_soft"]
+            config_text = "不受支持"
+            if safe_recovery:
+                hint = "当前 DeepSeek 模型不受支持；只能安全切回 OpenAI。"
+            else:
+                hint = "当前 DeepSeek 模型不受支持，且没有可用的 OpenAI 配置备份。"
+            provider_safe = False
         elif is_deepseek and not self.provider_status.managed:
             badge_text = "当前使用"
             badge_fg = COLORS["teal"]
             badge_bg = COLORS["teal_soft"]
             if self.provider_status.external_backup_available:
-                config_text = "可安全恢复"
-                hint = "检测到官方备份，可安全切回 OpenAI。"
-                action_enabled = True
+                config_text = "检测到备份"
+                hint = "检测到官方备份；切回时将先校验内容，再恢复 OpenAI。"
+                provider_safe = True
             else:
                 config_text = "外部配置"
                 hint = "未找到原始 OpenAI 配置，暂不能安全切回。"
-                action_enabled = False
+                provider_safe = False
         elif is_deepseek:
             badge_text = "当前使用"
             badge_fg = COLORS["teal"]
             badge_bg = COLORS["teal_soft"]
             config_text = "已接管"
             hint = "切回时将恢复原有 OpenAI 设置。"
-            action_enabled = True
+            provider_safe = True
         else:
             badge_text = "可用"
             badge_fg = COLORS["primary"]
             badge_bg = COLORS["primary_soft"]
             config_text = "就绪"
             hint = "切换后将自动重启 Codex。"
-            action_enabled = True
+            provider_safe = True
 
-        if not is_deepseek and (self.credential_status_error or self.credential_store is None):
+        if self.credential_status_error:
+            hint = self.credential_status_error
+            if not is_deepseek:
+                provider_safe = False
+        elif not is_deepseek and self.credential_store is None:
             hint = "请先重新设置 DeepSeek API Key。"
-            action_enabled = False
+            provider_safe = False
 
         self.provider_badge.configure(
             text=badge_text,
@@ -1903,11 +2187,14 @@ class AccountSwitcherApp:
         )
         self.provider_config_value.configure(text=config_text, fg=badge_fg)
         self.provider_hint.configure(
-            text=hint, fg=badge_fg if not action_enabled else COLORS["muted"]
+            text=hint, fg=badge_fg if not provider_safe else COLORS["muted"]
         )
-        self.provider_action_button.configure(
-            text=PROVIDER_BUTTON_OPENAI if is_deepseek else PROVIDER_BUTTON_DEEPSEEK
-        )
+        if is_deepseek and active_model_supported and active_model == self.selected_deepseek_model:
+            model_action_text = "当前已使用 {}".format(selected_label)
+        else:
+            model_action_text = "切换到 {} 并重启".format(selected_label)
+        self.provider_action_button.configure(text=model_action_text)
+        self.provider_openai_button.configure(text=PROVIDER_BUTTON_OPENAI)
         self.provider_key_button.configure(
             text=(
                 "重新设置 API Key"
@@ -1918,21 +2205,27 @@ class AccountSwitcherApp:
             )
         )
         enabled = not self.busy
-        provider_can_be_managed = not (
-            is_deepseek
-            and not self.provider_status.managed
-            and not self.provider_status.external_backup_available
+        provider_can_be_managed = not is_deepseek or (
+            active_model_supported and safe_recovery and not self.provider_status.conflict
         )
-        self.provider_action_button.set_enabled(enabled and action_enabled)
+        model_action_enabled = provider_safe and (
+            not is_deepseek or active_model != self.selected_deepseek_model
+        )
+        restore_enabled = is_deepseek and safe_recovery and not self.provider_status.conflict
+        self.provider_action_button.set_enabled(enabled and model_action_enabled)
+        self.provider_openai_button.set_enabled(enabled and restore_enabled)
         self.provider_key_button.set_enabled(
             enabled
             and self.credential_store is not None
             and provider_can_be_managed
             and not self.provider_status.conflict
         )
+        for button in self.provider_model_buttons.values():
+            button.set_enabled(enabled and provider_can_be_managed)
         self.provider_refresh_button.set_enabled(enabled)
         if self.provider_in_progress:
-            self.provider_action_button.set_progress(self.provider_button_text)
+            progress_button = self.provider_progress_button or self.provider_action_button
+            progress_button.set_progress(self.provider_button_text)
 
     def configure_deepseek_key(self) -> None:
         if self.busy:
@@ -1946,8 +2239,9 @@ class AccountSwitcherApp:
             return
         try:
             current_key = self._read_api_key()
-        except CredentialStoreError:
-            current_key = None
+        except CredentialStoreError as exc:
+            self.show_notice("无法读取 API Key", str(exc), "error")
+            return
 
         dialog = ApiKeyDialog(
             self.root,
@@ -1963,20 +2257,7 @@ class AccountSwitcherApp:
                 destructive=True,
             ):
                 return
-            self._set_busy(True)
-            try:
-                self.credential_store.delete()
-            except CredentialStoreError as exc:
-                error_message = str(exc)
-            else:
-                error_message = ""
-            finally:
-                self._set_busy(False)
-            self.refresh_provider_status(show_error=False)
-            if error_message:
-                self.show_notice("移除失败", error_message, "error")
-            else:
-                self.show_notice("API Key 已移除", "已删除本机保存的 DeepSeek API Key。", "success")
+            self._begin_saved_key_mutation(None, current_key)
             return
         if dialog.result is None or dialog.result == current_key:
             return
@@ -1988,28 +2269,23 @@ class AccountSwitcherApp:
                 "更新并重启",
             ):
                 return
-            self._begin_provider_switch("deepseek", dialog.result, "update_key")
+            self._begin_provider_switch(
+                "deepseek",
+                dialog.result,
+                "update_key",
+                target_model=None,
+                progress_button=self.provider_key_button,
+                expected_key=current_key,
+            )
             return
 
-        self._set_busy(True)
-        try:
-            self.credential_store.write(dialog.result)
-        except CredentialStoreError as exc:
-            error_message = str(exc)
-        else:
-            error_message = ""
-        finally:
-            self._set_busy(False)
-        self.refresh_provider_status(show_error=False)
-        if error_message:
-            self.show_notice("保存失败", error_message, "error")
-        else:
-            self.show_notice("API Key 已保存", "DeepSeek API Key 已安全保存。", "success")
+        self._begin_saved_key_mutation(dialog.result, current_key)
 
     def toggle_provider(self) -> None:
         if self.busy:
             return
-        self.refresh_provider_status(show_error=False)
+        target_model = self.selected_deepseek_model
+        self.refresh_provider_status(show_error=False, sync_selection=False)
         if self.provider_status_error:
             self.show_notice("无法切换", self.provider_status_error, "error")
             return
@@ -2021,39 +2297,99 @@ class AccountSwitcherApp:
             )
             return
 
-        if self.provider_status.mode == "deepseek":
-            if not self.show_confirm(
-                "切回 OpenAI",
-                "将恢复 OpenAI 配置，并重启 Codex。\n正在运行的任务可能会中断。",
-                "切回并重启",
-            ):
-                return
-            self._begin_provider_switch("openai", None, "switch")
+        if target_model not in SUPPORTED_DEEPSEEK_MODELS:
+            self.show_notice("无法切换", "所选 DeepSeek 模型不受支持。", "error")
             return
+        if self.provider_status.mode == "deepseek":
+            active_model = self.provider_status.active_model
+            if active_model not in SUPPORTED_DEEPSEEK_MODELS:
+                self.show_notice(
+                    "无法切换模型",
+                    "当前 DeepSeek 模型未知或不受支持；请先安全切回 OpenAI。",
+                    "warning",
+                )
+                return
+            if active_model == target_model:
+                return
 
         try:
             api_key = self._read_api_key()
         except CredentialStoreError as exc:
             self.show_notice("无法读取 API Key", str(exc), "error")
             return
+        expected_key = api_key
         if api_key is None:
             dialog = ApiKeyDialog(self.root, self.font_family)
             if dialog.result is None:
                 return
             api_key = dialog.result
         if not self.show_confirm(
-            "切换到 DeepSeek",
-            "将切换到 DeepSeek V4 Flash，并重启 Codex。\n正在运行的任务可能会中断。",
+            "切换 DeepSeek 模型",
+            "将切换到 DeepSeek {}，并重启 Codex。\n正在运行的任务可能会中断。".format(
+                DEEPSEEK_MODEL_LABELS[target_model]
+            ),
             "切换并重启",
         ):
             return
-        self._begin_provider_switch("deepseek", api_key, "switch")
+        self._begin_provider_switch(
+            "deepseek",
+            api_key,
+            "switch",
+            target_model=target_model,
+            progress_button=self.provider_action_button,
+            expected_key=expected_key,
+        )
 
-    def _set_provider_progress(self, button_text: str, message: str) -> None:
+    def restore_openai_provider(self) -> None:
+        if self.busy:
+            return
+        self.refresh_provider_status(show_error=False, sync_selection=False)
+        if self.provider_status_error:
+            self.show_notice("无法切换", self.provider_status_error, "error")
+            return
+        if self.provider_status.mode != "deepseek":
+            return
+        if self.provider_status.conflict:
+            self.show_notice(
+                "配置已变更",
+                "检测到 Codex 配置已在外部修改。为避免覆盖，本次操作已取消。",
+                "warning",
+            )
+            return
+        if not (self.provider_status.managed or self.provider_status.external_backup_available):
+            self.show_notice(
+                "无法安全恢复",
+                "未找到可用的 OpenAI 配置备份，本次操作已取消。",
+                "warning",
+            )
+            return
+        if not self.show_confirm(
+            "切回 OpenAI",
+            "将恢复 OpenAI 配置，并重启 Codex。\n正在运行的任务可能会中断。",
+            "切回并重启",
+        ):
+            return
+        self._begin_provider_switch(
+            "openai",
+            None,
+            "switch",
+            target_model=None,
+            progress_button=self.provider_openai_button,
+        )
+
+    def _set_provider_progress(
+        self,
+        button_text: str,
+        message: str,
+        progress_button: Optional[FlatButton] = None,
+    ) -> None:
         self.provider_in_progress = True
         self.provider_button_text = button_text
+        if progress_button is not None:
+            self.provider_progress_button = progress_button
         self._set_busy(True, message)
-        self.provider_action_button.set_progress(button_text)
+        active_button = self.provider_progress_button or self.provider_action_button
+        active_button.set_progress(button_text)
         self.provider_hint.configure(text=message, fg=COLORS["primary"])
 
     def _begin_provider_switch(
@@ -2061,11 +2397,20 @@ class AccountSwitcherApp:
         target_mode: str,
         api_key: Optional[str],
         action: str,
+        target_model: Optional[str] = None,
+        progress_button: Optional[FlatButton] = None,
+        expected_key=_KEY_EXPECTATION_UNSET,
     ) -> None:
-        self._set_provider_progress("正在准备…", "正在准备切换…")
+        if target_mode == "deepseek" and action == "switch" and target_model is None:
+            target_model = self.selected_deepseek_model
+        self._set_provider_progress(
+            "正在准备…",
+            "正在准备切换…",
+            progress_button=progress_button,
+        )
         worker = threading.Thread(
             target=self._provider_switch_worker,
-            args=(target_mode, api_key, action),
+            args=(target_mode, api_key, action, target_model, expected_key),
             name="ProviderSwitchWorker",
             daemon=False,
         )
@@ -2077,41 +2422,139 @@ class AccountSwitcherApp:
         target_mode: str,
         api_key: Optional[str],
         action: str,
+        target_model: Optional[str],
+        expected_key,
     ) -> None:
+        terminal = None
         try:
             with self.store.codex_operation_guard(self.target_auth_path):
-                self._provider_switch_worker_locked(target_mode, api_key, action)
+                terminal = self._provider_switch_worker_locked(
+                    target_mode,
+                    api_key,
+                    action,
+                    target_model,
+                    expected_key,
+                )
         except AccountStoreError as exc:
+            if terminal is None:
+                self.provider_queue.put({"status": "provider_error", "message": str(exc)})
+            else:
+                terminal["lock_warning"] = str(exc)
+                self.provider_queue.put(terminal)
+        except (ProviderConfigError, CredentialStoreError, InvalidApiKeyError) as exc:
             self.provider_queue.put({"status": "provider_error", "message": str(exc)})
         except Exception:
             self.provider_queue.put(
                 {"status": "provider_error", "message": "系统未能建立模型服务切换事务。"}
             )
+        else:
+            self.provider_queue.put(terminal)
 
     def _provider_switch_worker_locked(
         self,
         target_mode: str,
         api_key: Optional[str],
         action: str,
-    ) -> None:
+        target_model: Optional[str],
+        expected_key,
+    ) -> dict:
+        if target_mode not in ("deepseek", "openai"):
+            raise ProviderConfigError("不支持的目标模型服务。")
+        if action not in ("switch", "update_key"):
+            raise ProviderConfigError("不支持的模型服务操作。")
+        if target_mode == "openai" and action != "switch":
+            raise ProviderConfigError("OpenAI 恢复操作无效。")
+        if self.provider_manager is None:
+            raise ProviderConfigError("模型服务配置组件不可用。")
+
+        effective_model = target_model
+        locked_status = self.provider_manager.status()
+        if target_mode == "deepseek":
+            if locked_status.conflict:
+                raise ProviderConfigError("Codex 配置已在外部修改，本次操作已取消。")
+            if (
+                locked_status.mode == "deepseek"
+                and locked_status.active_model not in SUPPORTED_DEEPSEEK_MODELS
+            ):
+                raise ProviderConfigError("当前 DeepSeek 模型未知或不受支持，本次操作已取消。")
+            if (
+                locked_status.mode == "deepseek"
+                and not locked_status.managed
+                and not locked_status.external_backup_available
+            ):
+                raise ProviderConfigError("未找到可用的 OpenAI 配置备份，本次操作已取消。")
+            if action == "update_key":
+                if (
+                    locked_status.mode != "deepseek"
+                    or locked_status.active_model not in SUPPORTED_DEEPSEEK_MODELS
+                ):
+                    raise ProviderConfigError("无法确认当前 DeepSeek 模型，本次操作已取消。")
+                effective_model = locked_status.active_model
+            elif effective_model not in SUPPORTED_DEEPSEEK_MODELS:
+                raise ProviderConfigError("所选 DeepSeek 模型不受支持。")
+        else:
+            if locked_status.mode == "openai":
+                return {
+                    "status": "provider_noop",
+                    "target_mode": "openai",
+                    "action": action,
+                    "message": "当前已经使用 OpenAI，无需重启 Codex。",
+                }
+            if locked_status.conflict:
+                raise ProviderConfigError("Codex 配置已在外部修改，本次操作已取消。")
+            if not (locked_status.managed or locked_status.external_backup_available):
+                raise ProviderConfigError("未找到可用的 OpenAI 配置备份，本次操作已取消。")
+
+        if target_mode == "deepseek" and expected_key is not _KEY_EXPECTATION_UNSET:
+            try:
+                locked_key = self._read_api_key()
+            except CredentialStoreError as exc:
+                raise CredentialStoreError(
+                    "无法读取现有 DeepSeek API Key。"
+                    "为避免凭据无法恢复，本次操作已在关闭 Codex 前取消。"
+                ) from exc
+            if locked_key != expected_key:
+                raise CredentialStoreError(
+                    "DeepSeek API Key 已在其他窗口发生变化。"
+                    "为避免覆盖较新的凭据，本次操作已取消，请刷新后重试。"
+                )
+
+        if (
+            locked_status.mode == "deepseek"
+            and locked_status.managed
+            and not locked_status.conflict
+        ):
+            active_key_reader = getattr(self.provider_manager, "managed_deepseek_api_key", None)
+            if callable(active_key_reader):
+                active_key = active_key_reader()
+                if active_key is not None:
+                    reconcile_active_credential(self.credential_store, active_key)
+                    if target_mode == "deepseek" and action == "switch":
+                        api_key = active_key
+
         client = self.codex_client
         if client is None:
             client = StoreCodexClient()
         previous_key: Optional[str] = None
-        previous_key_unreadable = False
+        normalized_key: Optional[str] = None
         credential_changed = False
         stopped = False
+        was_running = False
         try:
-            try:
-                previous_key = self._read_api_key()
-            except CredentialStoreError:
-                previous_key = None
-                previous_key_unreadable = True
+            if target_mode == "deepseek":
+                try:
+                    previous_key = self._read_api_key()
+                except CredentialStoreError as exc:
+                    raise CredentialStoreError(
+                        "无法读取现有 DeepSeek API Key。"
+                        "为避免凭据无法恢复，本次操作已在关闭 Codex 前取消。"
+                    ) from exc
             self.provider_queue.put(
                 {"status": "progress", "message": "正在关闭 Codex…", "button": "正在关闭…"}
             )
             stop_result = client.stop()
             stopped = True
+            was_running = stop_result.was_running
 
             self.provider_queue.put(
                 {"status": "progress", "message": "正在更新模型服务…", "button": "正在切换…"}
@@ -2123,20 +2566,27 @@ class AccountSwitcherApp:
                 if normalized_key != previous_key:
                     self.credential_store.write(normalized_key)
                     credential_changed = True
-                switch_result = self.provider_manager.activate_deepseek(normalized_key)
+                switch_result = self.provider_manager.activate_deepseek(
+                    normalized_key,
+                    effective_model,
+                )
             else:
                 switch_result = self.provider_manager.restore_openai()
-        except (ProviderConfigError, CredentialStoreError, InvalidApiKeyError) as exc:
+        except (
+            ProviderConfigError,
+            CredentialStoreError,
+            InvalidApiKeyError,
+            CodexClientError,
+        ) as exc:
             recovery_notes = []
             if credential_changed:
-                try:
-                    if previous_key is None or previous_key_unreadable:
-                        self.credential_store.delete()
-                    else:
-                        self.credential_store.write(previous_key)
-                except CredentialStoreError:
-                    recovery_notes.append("API Key 未能恢复。")
-            if stopped:
+                recovery_note = self._restore_provider_credential_if_owned(
+                    normalized_key,
+                    previous_key,
+                )
+                if recovery_note:
+                    recovery_notes.append(recovery_note)
+            if stopped and was_running:
                 try:
                     client.start()
                 except Exception:
@@ -2144,26 +2594,25 @@ class AccountSwitcherApp:
             message = str(exc)
             if recovery_notes:
                 message += "\n" + " ".join(recovery_notes)
-            self.provider_queue.put({"status": "provider_error", "message": message})
-            return
+            return {"status": "provider_error", "message": message}
         except Exception:
+            recovery_notes = []
             if credential_changed:
-                try:
-                    if previous_key is None or previous_key_unreadable:
-                        self.credential_store.delete()
-                    else:
-                        self.credential_store.write(previous_key)
-                except CredentialStoreError:
-                    pass
-            if stopped:
+                recovery_note = self._restore_provider_credential_if_owned(
+                    normalized_key,
+                    previous_key,
+                )
+                if recovery_note:
+                    recovery_notes.append(recovery_note)
+            if stopped and was_running:
                 try:
                     client.start()
                 except Exception:
-                    pass
-            self.provider_queue.put(
-                {"status": "provider_error", "message": "系统未能完成模型服务切换。"}
-            )
-            return
+                    recovery_notes.append("请手动启动 Codex。")
+            message = "系统未能完成模型服务切换。"
+            if recovery_notes:
+                message += "\n" + " ".join(recovery_notes)
+            return {"status": "provider_error", "message": message}
 
         self.provider_queue.put(
             {"status": "progress", "message": "正在启动 Codex…", "button": "正在启动…"}
@@ -2171,38 +2620,59 @@ class AccountSwitcherApp:
         try:
             launched_pid = client.start()
         except CodexClientError as exc:
-            self.provider_queue.put(
-                {
-                    "status": "provider_restart_error",
-                    "target_mode": target_mode,
-                    "action": action,
-                    "message": str(exc) or "系统未能启动 Codex。",
-                }
-            )
-            return
-        except Exception:
-            self.provider_queue.put(
-                {
-                    "status": "provider_restart_error",
-                    "target_mode": target_mode,
-                    "action": action,
-                    "message": "系统未能启动 Codex。",
-                }
-            )
-            return
-        self.provider_queue.put(
-            {
-                "status": "provider_success",
+            return {
+                "status": "provider_restart_error",
                 "target_mode": target_mode,
+                "target_model": effective_model,
                 "action": action,
-                "changed": switch_result.changed,
-                "result": RestartResult(
-                    was_running=stop_result.was_running,
-                    forced_close=stop_result.forced_close,
-                    launched_pid=launched_pid,
-                ),
+                "message": str(exc) or "系统未能启动 Codex。",
             }
-        )
+        except Exception:
+            return {
+                "status": "provider_restart_error",
+                "target_mode": target_mode,
+                "target_model": effective_model,
+                "action": action,
+                "message": "系统未能启动 Codex。",
+            }
+        return {
+            "status": "provider_success",
+            "target_mode": target_mode,
+            "target_model": switch_result.active_model or effective_model,
+            "action": action,
+            "changed": switch_result.changed,
+            "result": RestartResult(
+                was_running=stop_result.was_running,
+                forced_close=stop_result.forced_close,
+                launched_pid=launched_pid,
+            ),
+        }
+
+    def _restore_provider_credential_if_owned(
+        self,
+        replacement_key: Optional[str],
+        previous_key: Optional[str],
+    ) -> Optional[str]:
+        """Undo our credential write without overwriting a newer external value."""
+
+        if replacement_key is None:
+            return "API Key 未能恢复。"
+        try:
+            current_key = self._read_api_key()
+        except CredentialStoreError:
+            return "API Key 当前状态无法确认，未执行恢复。"
+        if current_key == previous_key:
+            return None
+        if current_key != replacement_key:
+            return "检测到 API Key 已被其他程序更新，已保留较新的凭据。"
+        try:
+            if previous_key is None:
+                self.credential_store.delete()
+            else:
+                self.credential_store.write(previous_key)
+        except CredentialStoreError:
+            return "API Key 未能恢复。"
+        return None
 
     def _schedule_provider_poll(self) -> None:
         if self.provider_poll_id is None:
@@ -2225,15 +2695,41 @@ class AccountSwitcherApp:
         self.provider_in_progress = False
         self.provider_button_text = ""
         self._set_busy(False)
+        self.provider_progress_button = None
         self.refresh_provider_status(show_error=False)
         self.refresh_profiles()
 
         status = outcome.get("status")
+        if status == "credential_error":
+            title = "移除失败" if outcome.get("action") == "delete" else "保存失败"
+            self.show_notice(title, outcome["message"], "error")
+            return
+        if status == "credential_success":
+            if outcome.get("action") == "delete":
+                self.show_notice(
+                    "API Key 已移除",
+                    "已删除本机保存的 DeepSeek API Key。",
+                    "success",
+                )
+            else:
+                self.show_notice(
+                    "API Key 已保存",
+                    "DeepSeek API Key 已安全保存。",
+                    "success",
+                )
+            return
         if status == "provider_error":
             self.show_notice("切换失败", outcome["message"], "error")
             return
+        if status == "provider_noop":
+            self.show_notice("无需切换", outcome["message"], "info")
+            return
         target_mode = outcome.get("target_mode", "openai")
-        target_name = "DeepSeek" if target_mode == "deepseek" else "OpenAI"
+        target_model = outcome.get("target_model")
+        target_model_label = DEEPSEEK_MODEL_LABELS.get(target_model, "DeepSeek")
+        target_name = (
+            "DeepSeek {}".format(target_model_label) if target_mode == "deepseek" else "OpenAI"
+        )
         if status == "provider_restart_error":
             self.show_notice(
                 "配置已更新",
@@ -2257,14 +2753,20 @@ class AccountSwitcherApp:
         client_action = "已重新启动" if restart_result.was_running else "已启动"
         if action == "update_key":
             title = "API Key 已更新"
-            message = "DeepSeek API Key 已更新，Codex {}。".format(client_action)
+            message = "DeepSeek {} 的 API Key 已更新，Codex {}。".format(
+                target_model_label,
+                client_action,
+            )
         elif target_mode == "deepseek":
-            title = "已切换到 DeepSeek"
-            message = "Codex {}。".format(client_action)
+            title = "已切换到 DeepSeek {}".format(target_model_label)
+            message = "所选模型已生效，Codex {}。".format(client_action)
         else:
             title = "已切回 OpenAI"
             message = "Codex {}。".format(client_action)
-        self.show_notice(title, message, "success")
+        lock_warning = outcome.get("lock_warning")
+        if lock_warning:
+            message += "\n\n配置已提交，但操作锁释放异常：{}".format(lock_warning)
+        self.show_notice(title, message, "warning" if lock_warning else "success")
 
     def show_notice(self, title: str, message: str, kind: str = "info") -> None:
         NoticeDialog(self.root, title, message, self.font_family, kind)
@@ -2296,8 +2798,11 @@ class AccountSwitcherApp:
         self.accounts_tab_button.set_enabled(not busy)
         self.deepseek_tab_button.set_enabled(not busy)
         self.provider_action_button.set_enabled(not busy)
+        self.provider_openai_button.set_enabled(not busy)
         self.provider_key_button.set_enabled(not busy)
         self.provider_refresh_button.set_enabled(not busy)
+        for button in self.provider_model_buttons.values():
+            button.set_enabled(not busy)
         self._render_selection()
         if not busy and not self.provider_in_progress:
             self.refresh_provider_status(show_error=False)
@@ -2655,20 +3160,30 @@ class AccountSwitcherApp:
         self._set_restart_progress("正在准备…", "正在准备切换…")
         worker = threading.Thread(
             target=self._restart_codex_worker,
-            args=(profile.profile_id, profile.remark),
+            args=(profile.profile_id, profile.remark, deepseek_active),
             name="CodexRestartWorker",
             daemon=False,
         )
         worker.start()
         self._schedule_restart_poll()
 
-    def _restart_codex_worker(self, profile_id: str, remark: str) -> None:
+    def _restart_codex_worker(
+        self,
+        profile_id: str,
+        remark: str,
+        confirmed_deepseek_active: bool,
+    ) -> None:
         client = self.codex_client
         if client is None:
             client = StoreCodexClient()
 
         client_stopped = False
+        client_was_running = False
         sync_result = None
+        terminal = None
+
+        class _AccountSwitchFinished(Exception):
+            pass
 
         def sync_outcome_fields():
             if sync_result is not None and sync_result.changed and sync_result.profile is not None:
@@ -2679,7 +3194,7 @@ class AccountSwitcherApp:
             return {}
 
         def restart_after_failure() -> str:
-            if not client_stopped:
+            if not client_stopped or not client_was_running:
                 return ""
             try:
                 client.start()
@@ -2695,28 +3210,34 @@ class AccountSwitcherApp:
                         raise ProviderConfigError(
                             "Codex 配置已在外部修改。为避免覆盖，本次操作已取消。"
                         )
+                    provider_was_deepseek = provider_status.mode == "deepseek"
+                    if provider_was_deepseek != confirmed_deepseek_active:
+                        raise ProviderConfigError(
+                            "模型服务状态已在其他窗口发生变化。"
+                            "为避免执行未经确认的服务恢复，本次账号切换已取消，请刷新后重试。"
+                        )
+                    if provider_was_deepseek and not (
+                        provider_status.managed or provider_status.external_backup_available
+                    ):
+                        raise ProviderConfigError(
+                            "未找到可用的 OpenAI 配置备份，本次账号切换已取消。"
+                        )
                 except (ProviderConfigError, AttributeError) as exc:
-                    self.restart_queue.put(
-                        {
-                            "status": "switch_error",
-                            "remark": remark,
-                            "message": str(exc) or "无法检测当前模型服务。",
-                            "client_stopped": False,
-                        }
-                    )
-                    return
+                    terminal = {
+                        "status": "switch_error",
+                        "remark": remark,
+                        "message": str(exc) or "无法检测当前模型服务。",
+                        "client_stopped": False,
+                    }
+                    raise _AccountSwitchFinished
                 except Exception:
-                    self.restart_queue.put(
-                        {
-                            "status": "switch_error",
-                            "remark": remark,
-                            "message": "系统未能检测当前模型服务。",
-                            "client_stopped": False,
-                        }
-                    )
-                    return
-                provider_was_deepseek = provider_status.mode == "deepseek"
-
+                    terminal = {
+                        "status": "switch_error",
+                        "remark": remark,
+                        "message": "系统未能检测当前模型服务。",
+                        "client_stopped": False,
+                    }
+                    raise _AccountSwitchFinished
                 try:
                     self.restart_queue.put(
                         {
@@ -2727,26 +3248,23 @@ class AccountSwitcherApp:
                     )
                     stop_result = client.stop()
                     client_stopped = True
+                    client_was_running = stop_result.was_running
                 except CodexClientError as exc:
-                    self.restart_queue.put(
-                        {
-                            "status": "switch_error",
-                            "remark": remark,
-                            "message": str(exc),
-                            "client_stopped": False,
-                        }
-                    )
-                    return
+                    terminal = {
+                        "status": "switch_error",
+                        "remark": remark,
+                        "message": str(exc),
+                        "client_stopped": False,
+                    }
+                    raise _AccountSwitchFinished
                 except Exception:
-                    self.restart_queue.put(
-                        {
-                            "status": "switch_error",
-                            "remark": remark,
-                            "message": "系统未能关闭 Codex。",
-                            "client_stopped": False,
-                        }
-                    )
-                    return
+                    terminal = {
+                        "status": "switch_error",
+                        "remark": remark,
+                        "message": "系统未能关闭 Codex。",
+                        "client_stopped": False,
+                    }
+                    raise _AccountSwitchFinished
 
                 self.restart_queue.put(
                     {
@@ -2758,27 +3276,21 @@ class AccountSwitcherApp:
                 try:
                     sync_result = self.store.sync_current_profile(self.target_auth_path)
                 except AccountStoreError as exc:
-                    self.restart_queue.put(
-                        {
-                            "status": "switch_error",
-                            "remark": remark,
-                            "message": str(exc) + restart_after_failure(),
-                            "client_stopped": True,
-                        }
-                    )
-                    return
+                    terminal = {
+                        "status": "switch_error",
+                        "remark": remark,
+                        "message": str(exc) + restart_after_failure(),
+                        "client_stopped": True,
+                    }
+                    raise _AccountSwitchFinished
                 except Exception:
-                    self.restart_queue.put(
-                        {
-                            "status": "switch_error",
-                            "remark": remark,
-                            "message": (
-                                "系统未能保存当前账号的最新认证。" + restart_after_failure()
-                            ),
-                            "client_stopped": True,
-                        }
-                    )
-                    return
+                    terminal = {
+                        "status": "switch_error",
+                        "remark": remark,
+                        "message": "系统未能保存当前账号的最新认证。" + restart_after_failure(),
+                        "client_stopped": True,
+                    }
+                    raise _AccountSwitchFinished
 
                 self.restart_queue.put(
                     {
@@ -2790,27 +3302,23 @@ class AccountSwitcherApp:
                 try:
                     switch_result = self.store.switch_profile(profile_id, self.target_auth_path)
                 except AccountStoreError as exc:
-                    self.restart_queue.put(
-                        {
-                            "status": "switch_error",
-                            "remark": remark,
-                            "message": str(exc) + restart_after_failure(),
-                            "client_stopped": True,
-                            **sync_outcome_fields(),
-                        }
-                    )
-                    return
+                    terminal = {
+                        "status": "switch_error",
+                        "remark": remark,
+                        "message": str(exc) + restart_after_failure(),
+                        "client_stopped": True,
+                        **sync_outcome_fields(),
+                    }
+                    raise _AccountSwitchFinished
                 except Exception:
-                    self.restart_queue.put(
-                        {
-                            "status": "switch_error",
-                            "remark": remark,
-                            "message": "系统未能更新认证文件。" + restart_after_failure(),
-                            "client_stopped": True,
-                            **sync_outcome_fields(),
-                        }
-                    )
-                    return
+                    terminal = {
+                        "status": "switch_error",
+                        "remark": remark,
+                        "message": "系统未能更新认证文件。" + restart_after_failure(),
+                        "client_stopped": True,
+                        **sync_outcome_fields(),
+                    }
+                    raise _AccountSwitchFinished
 
                 if provider_was_deepseek:
                     self.restart_queue.put(
@@ -2834,16 +3342,14 @@ class AccountSwitcherApp:
                         message = str(exc)
                         if recovery_notes:
                             message += "\n" + " ".join(recovery_notes)
-                        self.restart_queue.put(
-                            {
-                                "status": "switch_error",
-                                "remark": remark,
-                                "message": message,
-                                "client_stopped": True,
-                                **sync_outcome_fields(),
-                            }
-                        )
-                        return
+                        terminal = {
+                            "status": "switch_error",
+                            "remark": remark,
+                            "message": message,
+                            "client_stopped": True,
+                            **sync_outcome_fields(),
+                        }
+                        raise _AccountSwitchFinished
                     except Exception:
                         recovery_notes = []
                         try:
@@ -2856,16 +3362,14 @@ class AccountSwitcherApp:
                         message = "系统未能恢复 OpenAI 配置。"
                         if recovery_notes:
                             message += "\n" + " ".join(recovery_notes)
-                        self.restart_queue.put(
-                            {
-                                "status": "switch_error",
-                                "remark": remark,
-                                "message": message,
-                                "client_stopped": True,
-                                **sync_outcome_fields(),
-                            }
-                        )
-                        return
+                        terminal = {
+                            "status": "switch_error",
+                            "remark": remark,
+                            "message": message,
+                            "client_stopped": True,
+                            **sync_outcome_fields(),
+                        }
+                        raise _AccountSwitchFinished
 
                 self.restart_queue.put(
                     {"status": "progress", "message": "正在启动 Codex…", "button": "正在启动…"}
@@ -2873,69 +3377,69 @@ class AccountSwitcherApp:
                 try:
                     launched_pid = client.start()
                 except CodexClientError as exc:
-                    self.restart_queue.put(
-                        {
-                            "status": "restart_error",
-                            "profile_id": profile_id,
-                            "remark": remark,
-                            "changed": switch_result.changed or provider_was_deepseek,
-                            "provider_restored": provider_was_deepseek,
-                            "message": str(exc),
-                            **sync_outcome_fields(),
-                        }
-                    )
-                    return
-                except Exception:
-                    self.restart_queue.put(
-                        {
-                            "status": "restart_error",
-                            "profile_id": profile_id,
-                            "remark": remark,
-                            "changed": switch_result.changed or provider_was_deepseek,
-                            "provider_restored": provider_was_deepseek,
-                            "message": "系统未能完成 Codex 启动。",
-                            **sync_outcome_fields(),
-                        }
-                    )
-                    return
-
-                self.restart_queue.put(
-                    {
-                        "status": "success",
+                    terminal = {
+                        "status": "restart_error",
                         "profile_id": profile_id,
                         "remark": remark,
                         "changed": switch_result.changed or provider_was_deepseek,
                         "provider_restored": provider_was_deepseek,
+                        "message": str(exc),
                         **sync_outcome_fields(),
-                        "unmatched_current": sync_result.status == SYNC_STATUS_UNMATCHED,
-                        "current_backup_path": switch_result.backup_path,
-                        "result": RestartResult(
-                            was_running=stop_result.was_running,
-                            forced_close=stop_result.forced_close,
-                            launched_pid=launched_pid,
-                        ),
                     }
-                )
+                    raise _AccountSwitchFinished
+                except Exception:
+                    terminal = {
+                        "status": "restart_error",
+                        "profile_id": profile_id,
+                        "remark": remark,
+                        "changed": switch_result.changed or provider_was_deepseek,
+                        "provider_restored": provider_was_deepseek,
+                        "message": "系统未能完成 Codex 启动。",
+                        **sync_outcome_fields(),
+                    }
+                    raise _AccountSwitchFinished
+
+                terminal = {
+                    "status": "success",
+                    "profile_id": profile_id,
+                    "remark": remark,
+                    "changed": switch_result.changed or provider_was_deepseek,
+                    "provider_restored": provider_was_deepseek,
+                    **sync_outcome_fields(),
+                    "unmatched_current": sync_result.status == SYNC_STATUS_UNMATCHED,
+                    "current_backup_path": switch_result.backup_path,
+                    "result": RestartResult(
+                        was_running=stop_result.was_running,
+                        forced_close=stop_result.forced_close,
+                        launched_pid=launched_pid,
+                    ),
+                }
+        except _AccountSwitchFinished:
+            pass
         except AccountStoreError as exc:
-            self.restart_queue.put(
-                {
+            if terminal is None:
+                terminal = {
                     "status": "switch_error",
                     "remark": remark,
                     "message": str(exc) + restart_after_failure(),
                     "client_stopped": client_stopped,
                     **sync_outcome_fields(),
                 }
-            )
+            else:
+                terminal["lock_warning"] = str(exc)
         except Exception:
-            self.restart_queue.put(
-                {
+            if terminal is None:
+                terminal = {
                     "status": "switch_error",
                     "remark": remark,
                     "message": "系统未能完成账号切换。" + restart_after_failure(),
                     "client_stopped": client_stopped,
                     **sync_outcome_fields(),
                 }
-            )
+            else:
+                terminal["lock_warning"] = "账号切换已提交，但锁释放状态异常。"
+        if terminal is not None:
+            self.restart_queue.put(terminal)
 
     def _schedule_restart_poll(self) -> None:
         if self.restart_poll_id is None:
@@ -2964,6 +3468,7 @@ class AccountSwitcherApp:
         synced_remark = outcome.get("synced_remark")
         unmatched_current = outcome.get("unmatched_current", False)
         current_backup_path = outcome.get("current_backup_path")
+        lock_warning = outcome.get("lock_warning")
         self.restart_in_progress = False
         self.restart_button_text = ""
         self.switch_button.configure(text=SWITCH_BUTTON_TEXT)
@@ -3027,9 +3532,11 @@ class AccountSwitcherApp:
             message = "“{}”已是当前账号。".format(remark)
         if synced_remark:
             message += "\n已自动保存“{}”由 Codex 刷新后的最新认证。".format(synced_remark)
+        if lock_warning:
+            message += "\n\n切换已完成，但操作锁释放异常：{}".format(lock_warning)
         if unmatched_current and current_backup_path is not None:
             message += "\n原当前登录未匹配到账号列表，认证已保留在本地切换备份中。"
-        self.show_notice(title, message, "success")
+        self.show_notice(title, message, "warning" if lock_warning else "success")
 
     def update_selected_profile(self) -> None:
         if self.busy:

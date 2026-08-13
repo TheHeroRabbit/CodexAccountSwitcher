@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -15,7 +16,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, BinaryIO, Dict, Iterator, List, Optional
+from typing import Any, BinaryIO, Dict, Iterator, List, Optional, Sequence, Tuple
+
+from credential_store import CredentialStoreError, WindowsDataProtector
 
 STORAGE_FOLDER_NAME = "账号文件"
 BACKUP_FOLDER_NAME = "切换备份"
@@ -24,8 +27,11 @@ MANIFEST_FILE_NAME = "profiles.json"
 MANIFEST_BACKUP_FILE_NAME = "profiles.json.bak"
 STORAGE_LOCK_FILE_NAME = ".profiles.lock"
 TARGET_LOCK_FILE_NAME = ".codex-account-switcher.lock"
+ACCOUNT_TRANSACTION_FILE_NAME = ".codex-account-switcher-account-transaction.dat"
+ACCOUNT_TRANSACTION_VERSION = 1
 MAX_AUTH_FILE_BYTES = 10 * 1024 * 1024
 MAX_MANIFEST_FILE_BYTES = 2 * 1024 * 1024
+MAX_ACCOUNT_TRANSACTION_BYTES = 32 * 1024 * 1024
 MAX_REMARK_LENGTH = 60
 MANAGED_CHATGPT_AUTH_MODE = "chatgpt"
 DEFAULT_LOCK_TIMEOUT_SECONDS = 15.0
@@ -38,6 +44,12 @@ SYNC_STATUS_UPDATED = "updated"
 
 _PROFILE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_LEGACY_REMOVE_PATTERN = re.compile(
+    r"^\.auth_(?P<profile_id>[0-9a-f]{32})\.json\.(?P<tombstone_id>[0-9a-f]{32})\.remove$"
+)
+_ATOMIC_TEMPORARY_ID_PATTERN = r"[0-9a-f]{32}"
+_ACCOUNT_TRANSACTION_TARGETS = ("profile", "manifest_backup", "manifest")
+_ACCOUNT_TRANSACTION_OPERATIONS = {"import", "update", "remove", "rename", "repair"}
 _LOCK_RETRY_SECONDS = 0.05
 _LOCK_REGISTRY_GUARD = threading.Lock()
 _LOCK_REGISTRY: Dict[str, "_InterprocessFileLock"] = {}
@@ -53,6 +65,10 @@ class InvalidAuthFileError(AccountStoreError):
 
 class ProfileNotFoundError(AccountStoreError):
     """Raised when a selected profile no longer exists."""
+
+
+class AccountTransactionRecoveryError(AccountStoreError):
+    """Raised when a durable account-storage transaction cannot be recovered safely."""
 
 
 @dataclass(frozen=True)
@@ -257,6 +273,71 @@ def _shared_file_lock(path: Path) -> _InterprocessFileLock:
         return lock
 
 
+def _cleanup_atomic_temporaries(targets: Iterator[Path], label: str) -> None:
+    """Remove only stale temp files created for the exact supplied targets."""
+
+    patterns_by_parent: Dict[Path, List[re.Pattern[str]]] = {}
+    for raw_target in targets:
+        target = Path(raw_target).resolve()
+        pattern = re.compile(
+            r"^\.codex-account-switcher\.{}\.{}\.tmp$".format(
+                re.escape(target.name),
+                _ATOMIC_TEMPORARY_ID_PATTERN,
+            )
+        )
+        patterns_by_parent.setdefault(target.parent, []).append(pattern)
+
+    for parent, patterns in patterns_by_parent.items():
+        if not parent.exists():
+            continue
+        try:
+            entries = tuple(parent.iterdir())
+        except OSError as exc:
+            raise AccountStoreError("无法检查{}临时文件：{}".format(label, exc)) from exc
+        for entry in entries:
+            if not any(pattern.fullmatch(entry.name) for pattern in patterns):
+                continue
+            try:
+                if entry.is_file() or entry.is_symlink():
+                    entry.unlink()
+            except OSError as exc:
+                raise AccountStoreError("无法清理{}临时文件：{}".format(label, exc)) from exc
+
+
+@contextmanager
+def codex_operation_guard(
+    target_auth_path: Path,
+    timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[None]:
+    """Serialize a Codex mutation across threads and app processes.
+
+    This module-level guard deliberately shares the same in-process registry as
+    ``ProfileStore.codex_operation_guard``. Provider recovery can therefore use
+    the Codex lock on its public entry points while remaining reentrant when the
+    application already holds that lock for a larger credential/configuration
+    transaction.
+    """
+
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be a positive finite number")
+    target = Path(target_auth_path).resolve()
+    target_lock = _shared_file_lock(target.parent / TARGET_LOCK_FILE_NAME)
+    with target_lock.hold(float(timeout), "Codex 操作锁"):
+        _cleanup_atomic_temporaries(iter((target,)), "Codex 认证")
+        yield
+
+
+@contextmanager
+def codex_operation_guard_for_home(
+    codex_home: Path,
+    timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[None]:
+    """Serialize a Codex-home operation without requiring an auth file path."""
+
+    with codex_operation_guard(Path(codex_home).resolve() / "auth.json", timeout):
+        yield
+
+
 def _reject_non_standard_number(value: str) -> None:
     raise ValueError("JSON 中包含不支持的数值：{}".format(value))
 
@@ -351,7 +432,9 @@ def _atomic_copy(
     expected_sha256: Optional[str] = None,
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.parent / ".{}.{}.tmp".format(destination.name, uuid.uuid4().hex)
+    temporary = destination.parent / ".codex-account-switcher.{}.{}.tmp".format(
+        destination.name, uuid.uuid4().hex
+    )
     try:
         shutil.copy2(str(source), str(temporary))
         with temporary.open("r+b") as copied:
@@ -369,7 +452,9 @@ def _atomic_copy(
 
 def _atomic_write_json(destination: Path, value: Dict[str, Any]) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.parent / ".{}.{}.tmp".format(destination.name, uuid.uuid4().hex)
+    temporary = destination.parent / ".codex-account-switcher.{}.{}.tmp".format(
+        destination.name, uuid.uuid4().hex
+    )
     try:
         with temporary.open("w", encoding="utf-8", newline="\n") as output:
             json.dump(value, output, ensure_ascii=False, indent=2)
@@ -384,11 +469,94 @@ def _atomic_write_json(destination: Path, value: Dict[str, Any]) -> None:
             pass
 
 
+def _read_optional_bytes(path: Path, limit: int, label: str) -> Optional[bytes]:
+    """Read one optional regular file with a hard bound before and during the read."""
+
+    try:
+        file_size = path.stat().st_size
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AccountStoreError("无法读取{}信息：{}".format(label, exc)) from exc
+    if not path.is_file():
+        raise AccountStoreError("{}不是普通文件。".format(label))
+    if file_size > limit:
+        raise AccountStoreError("{}过大，已拒绝读取。".format(label))
+    try:
+        with path.open("rb") as source:
+            value = source.read(limit + 1)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AccountStoreError("无法读取{}：{}".format(label, exc)) from exc
+    if len(value) > limit:
+        raise AccountStoreError("{}过大，已拒绝读取。".format(label))
+    return value
+
+
+def _prepare_atomic_write(path: Path, value: bytes) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / ".codex-account-switcher.{}.{}.tmp".format(
+        path.name, uuid.uuid4().hex
+    )
+    try:
+        with temporary.open("wb") as output:
+            output.write(value)
+            output.flush()
+            os.fsync(output.fileno())
+    except Exception:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+    return temporary
+
+
+def _optional_bytes_match(path: Path, expected: Optional[bytes], limit: int, label: str) -> bool:
+    return _read_optional_bytes(path, limit, label) == expected
+
+
+def _guarded_replace_optional(
+    path: Path,
+    expected: Optional[bytes],
+    replacement: Optional[bytes],
+    limit: int,
+    label: str,
+) -> None:
+    """Replace or delete only while the target still has the expected bytes."""
+
+    if replacement is not None and len(replacement) > limit:
+        raise AccountStoreError("{}过大，已拒绝写入。".format(label))
+    if replacement is None:
+        if not _optional_bytes_match(path, expected, limit, label):
+            raise AccountStoreError("{}已在删除准备期间被外部修改。".format(label))
+        if expected is None:
+            return
+        try:
+            path.unlink()
+        except FileNotFoundError as exc:
+            raise AccountStoreError("{}已在删除提交期间被外部修改。".format(label)) from exc
+        return
+
+    temporary = _prepare_atomic_write(path, replacement)
+    try:
+        if not _optional_bytes_match(path, expected, limit, label):
+            raise AccountStoreError("{}已在写入准备期间被外部修改。".format(label))
+        os.replace(str(temporary), str(path))
+    finally:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+
 class ProfileStore:
     def __init__(
         self,
         app_directory: Path,
         lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+        protector=None,
     ) -> None:
         if not math.isfinite(lock_timeout) or lock_timeout <= 0:
             raise ValueError("lock_timeout must be a positive finite number")
@@ -398,23 +566,745 @@ class ProfileStore:
         self.update_backup_directory = self.storage_directory / UPDATE_BACKUP_FOLDER_NAME
         self.manifest_path = self.storage_directory / MANIFEST_FILE_NAME
         self.manifest_backup_path = self.storage_directory / MANIFEST_BACKUP_FILE_NAME
+        self.account_transaction_path = self.storage_directory / ACCOUNT_TRANSACTION_FILE_NAME
         self.storage_lock_path = self.storage_directory / STORAGE_LOCK_FILE_NAME
         self.lock_timeout = float(lock_timeout)
+        self.protector = protector if protector is not None else WindowsDataProtector()
         self.recovered_from_backup = False
 
     @contextmanager
     def _storage_guard(self) -> Iterator[None]:
         lock = _shared_file_lock(self.storage_lock_path)
         with lock.hold(self.lock_timeout, "账号存储锁"):
+            self._cleanup_storage_temporaries_locked()
+            self._recover_pending_account_transaction_locked()
+            self._recover_legacy_remove_tombstones_locked()
             yield
+
+    def _cleanup_storage_temporaries_locked(self) -> None:
+        targets = [
+            self.manifest_path,
+            self.manifest_backup_path,
+            self.account_transaction_path,
+        ]
+        if self.storage_directory.exists():
+            targets.extend(
+                path
+                for path in self.storage_directory.glob("auth_*.json")
+                if re.fullmatch(r"auth_[0-9a-f]{32}\.json", path.name)
+            )
+        for directory in (self.backup_directory, self.update_backup_directory):
+            if directory.exists():
+                targets.extend(
+                    path
+                    for path in directory.glob("auth_*.json")
+                    if re.fullmatch(r"auth_[0-9a-f_]+\.json", path.name)
+                )
+                # A crash before os.replace leaves only the hidden temp name,
+                # so derive its intended target from the strict app-owned form.
+                for path in directory.iterdir():
+                    match = re.fullmatch(
+                        r"\.codex-account-switcher\.(auth_[0-9a-f_]+\.json)\.{}\.tmp".format(
+                            _ATOMIC_TEMPORARY_ID_PATTERN
+                        ),
+                        path.name,
+                    )
+                    if match is not None:
+                        targets.append(directory / match.group(1))
+        if self.storage_directory.exists():
+            for path in self.storage_directory.iterdir():
+                match = re.fullmatch(
+                    r"\.codex-account-switcher\.(auth_[0-9a-f]{{32}}\.json)\.{}\.tmp".format(
+                        _ATOMIC_TEMPORARY_ID_PATTERN
+                    ),
+                    path.name,
+                )
+                if match is not None:
+                    targets.append(self.storage_directory / match.group(1))
+        _cleanup_atomic_temporaries(iter(targets), "账号存储")
+
+    def _profile_path_from_id(self, profile_id: str) -> Path:
+        if not isinstance(profile_id, str) or not _PROFILE_ID_PATTERN.fullmatch(profile_id):
+            raise AccountTransactionRecoveryError("账号存储事务日志包含无效账号 ID。")
+        return self.storage_directory / "auth_{}.json".format(profile_id)
+
+    def _path_limit(self, path: Path, profile_id: Optional[str] = None) -> int:
+        if path == self.account_transaction_path:
+            return MAX_ACCOUNT_TRANSACTION_BYTES
+        if path in (self.manifest_path, self.manifest_backup_path):
+            return MAX_MANIFEST_FILE_BYTES
+        if profile_id is not None and path == self._profile_path_from_id(profile_id):
+            return MAX_AUTH_FILE_BYTES
+        raise AccountTransactionRecoveryError("账号存储事务包含不受支持的目标。")
+
+    def _transaction_target(self, path: Path, profile_id: Optional[str]) -> str:
+        if path == self.manifest_path:
+            return "manifest"
+        if path == self.manifest_backup_path:
+            return "manifest_backup"
+        if profile_id is not None and path == self._profile_path_from_id(profile_id):
+            return "profile"
+        raise AccountStoreError("账号存储事务包含不受支持的写入目标。")
+
+    def _transaction_path(self, target: str, profile_id: Optional[str]) -> Path:
+        if target == "manifest":
+            return self.manifest_path
+        if target == "manifest_backup":
+            return self.manifest_backup_path
+        if target == "profile" and profile_id is not None:
+            return self._profile_path_from_id(profile_id)
+        raise AccountTransactionRecoveryError("账号存储事务日志包含无效目标。")
+
+    @staticmethod
+    def _encode_optional(value: Optional[bytes]) -> Optional[str]:
+        if value is None:
+            return None
+        return base64.b64encode(value).decode("ascii")
+
+    @staticmethod
+    def _decode_optional(value: Any, label: str, limit: int) -> Optional[bytes]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise AccountTransactionRecoveryError("{}事务前内容格式无效。".format(label))
+        try:
+            decoded = base64.b64decode(value.encode("ascii"), validate=True)
+        except (ValueError, UnicodeError) as exc:
+            raise AccountTransactionRecoveryError("{}事务前内容损坏。".format(label)) from exc
+        if len(decoded) > limit:
+            raise AccountTransactionRecoveryError("{}事务前内容过大。".format(label))
+        return decoded
+
+    @staticmethod
+    def _signature(value: Optional[bytes]) -> Dict[str, Any]:
+        if value is None:
+            return {"exists": False, "size": 0, "sha256": None}
+        return {
+            "exists": True,
+            "size": len(value),
+            "sha256": hashlib.sha256(value).hexdigest(),
+        }
+
+    @staticmethod
+    def _matches_signature(value: Optional[bytes], signature: Dict[str, Any]) -> bool:
+        if value is None:
+            return not signature["exists"]
+        return (
+            signature["exists"]
+            and len(value) == signature["size"]
+            and hashlib.sha256(value).hexdigest() == signature["sha256"]
+        )
+
+    def _validate_signature(self, value: Any, path: Path, profile_id: Optional[str]) -> None:
+        if not isinstance(value, dict) or set(value) != {"exists", "size", "sha256"}:
+            raise AccountTransactionRecoveryError("账号存储事务日志目标摘要无效。")
+        exists = value.get("exists")
+        size = value.get("size")
+        digest = value.get("sha256")
+        if (
+            not isinstance(exists, bool)
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or size > self._path_limit(path, profile_id)
+            or (exists and (not isinstance(digest, str) or not _SHA256_PATTERN.fullmatch(digest)))
+            or (not exists and (size != 0 or digest is not None))
+        ):
+            raise AccountTransactionRecoveryError("账号存储事务日志目标摘要无效。")
+
+    def _encode_account_transaction(
+        self,
+        operation: str,
+        profile_id: Optional[str],
+        changes: Sequence[Tuple[Path, Optional[bytes], Optional[bytes]]],
+    ) -> bytes:
+        if operation not in _ACCOUNT_TRANSACTION_OPERATIONS:
+            raise AccountStoreError("账号存储事务操作类型无效。")
+        if operation in {"import", "update", "remove", "rename"} and (
+            not isinstance(profile_id, str) or not _PROFILE_ID_PATTERN.fullmatch(profile_id)
+        ):
+            raise AccountStoreError("账号存储事务缺少有效账号 ID。")
+
+        entries = []
+        guards = []
+        for path, before, after in changes:
+            target = self._transaction_target(path, profile_id)
+            if before == after:
+                guards.append({"target": target, "before": self._signature(before)})
+            else:
+                entries.append(
+                    {
+                        "target": target,
+                        "before": self._encode_optional(before),
+                        "after": self._signature(after),
+                    }
+                )
+        if not entries:
+            raise AccountStoreError("账号存储事务没有需要写入的内容。")
+
+        payload = {
+            "version": ACCOUNT_TRANSACTION_VERSION,
+            "transaction_id": uuid.uuid4().hex,
+            "operation": operation,
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "storage_path": str(self.storage_directory),
+            "profile_id": profile_id,
+            "changes": entries,
+            "guards": guards,
+        }
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(serialized) > MAX_ACCOUNT_TRANSACTION_BYTES:
+            raise AccountStoreError("账号存储事务日志过大，已拒绝写入。")
+        try:
+            protected = self.protector.protect(serialized)
+        except CredentialStoreError as exc:
+            raise AccountStoreError("无法加密账号存储事务日志：{}".format(exc)) from exc
+        if not isinstance(protected, bytes) or len(protected) > MAX_ACCOUNT_TRANSACTION_BYTES:
+            raise AccountStoreError("账号存储事务日志过大或加密结果无效。")
+        return protected
+
+    def _decode_account_transaction(self, protected: bytes) -> Dict[str, Any]:
+        try:
+            serialized = self.protector.unprotect(protected)
+            if not isinstance(serialized, bytes) or len(serialized) > MAX_ACCOUNT_TRANSACTION_BYTES:
+                raise ValueError("unprotected transaction is too large")
+            transaction = json.loads(serialized.decode("utf-8"))
+        except (CredentialStoreError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise AccountTransactionRecoveryError(
+                "账号存储事务日志损坏或无法解密，已停止自动恢复。"
+            ) from exc
+        if not isinstance(transaction, dict):
+            raise AccountTransactionRecoveryError("账号存储事务日志格式不受支持。")
+        if set(transaction) != {
+            "version",
+            "transaction_id",
+            "operation",
+            "created_at",
+            "storage_path",
+            "profile_id",
+            "changes",
+            "guards",
+        }:
+            raise AccountTransactionRecoveryError("账号存储事务日志字段无效。")
+        if transaction.get("version") != ACCOUNT_TRANSACTION_VERSION:
+            raise AccountTransactionRecoveryError("账号存储事务日志版本不受支持。")
+        operation = transaction.get("operation")
+        if operation not in _ACCOUNT_TRANSACTION_OPERATIONS:
+            raise AccountTransactionRecoveryError("账号存储事务日志操作类型无效。")
+        transaction_id = transaction.get("transaction_id")
+        if not isinstance(transaction_id, str) or not _PROFILE_ID_PATTERN.fullmatch(transaction_id):
+            raise AccountTransactionRecoveryError("账号存储事务日志标识无效。")
+        created_at = transaction.get("created_at")
+        try:
+            created = datetime.fromisoformat(created_at) if isinstance(created_at, str) else None
+        except ValueError as exc:
+            raise AccountTransactionRecoveryError("账号存储事务日志时间无效。") from exc
+        if created is None or created.tzinfo is None or len(created_at) > 128:
+            raise AccountTransactionRecoveryError("账号存储事务日志时间无效。")
+
+        storage_path = transaction.get("storage_path")
+        storage_candidate = Path(storage_path) if isinstance(storage_path, str) else None
+        if (
+            storage_candidate is None
+            or not storage_candidate.is_absolute()
+            or storage_candidate.resolve() != self.storage_directory.resolve()
+        ):
+            raise AccountTransactionRecoveryError(
+                "账号存储事务日志不属于当前账号文件夹，已停止自动恢复。"
+            )
+
+        profile_id = transaction.get("profile_id")
+        if profile_id is not None and (
+            not isinstance(profile_id, str) or not _PROFILE_ID_PATTERN.fullmatch(profile_id)
+        ):
+            raise AccountTransactionRecoveryError("账号存储事务日志包含无效账号 ID。")
+        if operation in {"import", "update", "remove", "rename"} and profile_id is None:
+            raise AccountTransactionRecoveryError("账号存储事务日志缺少账号 ID。")
+
+        changes = transaction.get("changes")
+        guards = transaction.get("guards")
+        if not isinstance(changes, list) or not changes or len(changes) > 3:
+            raise AccountTransactionRecoveryError("账号存储事务日志变更列表无效。")
+        if not isinstance(guards, list) or len(guards) > 3:
+            raise AccountTransactionRecoveryError("账号存储事务日志守卫列表无效。")
+
+        seen = set()
+        decoded_changes = []
+        for entry in changes:
+            if not isinstance(entry, dict) or set(entry) != {"target", "before", "after"}:
+                raise AccountTransactionRecoveryError("账号存储事务日志变更项无效。")
+            target = entry.get("target")
+            if target not in _ACCOUNT_TRANSACTION_TARGETS or target in seen:
+                raise AccountTransactionRecoveryError("账号存储事务日志包含重复或未知目标。")
+            seen.add(target)
+            path = self._transaction_path(target, profile_id)
+            before = self._decode_optional(
+                entry.get("before"), path.name, self._path_limit(path, profile_id)
+            )
+            signature = entry.get("after")
+            self._validate_signature(signature, path, profile_id)
+            decoded_changes.append((path, before, signature))
+
+        decoded_guards = []
+        for guard in guards:
+            if not isinstance(guard, dict) or set(guard) != {"target", "before"}:
+                raise AccountTransactionRecoveryError("账号存储事务日志守卫无效。")
+            target = guard.get("target")
+            if target not in _ACCOUNT_TRANSACTION_TARGETS or target in seen:
+                raise AccountTransactionRecoveryError("账号存储事务日志包含重复或未知守卫。")
+            seen.add(target)
+            path = self._transaction_path(target, profile_id)
+            signature = guard.get("before")
+            self._validate_signature(signature, path, profile_id)
+            decoded_guards.append((path, signature))
+
+        expected_targets = {"manifest", "manifest_backup"}
+        if operation in {"import", "update", "remove"}:
+            expected_targets.add("profile")
+        if seen != expected_targets:
+            raise AccountTransactionRecoveryError("账号存储事务日志缺少或多出受管目标。")
+        transaction["decoded_changes"] = decoded_changes
+        transaction["decoded_guards"] = decoded_guards
+        return transaction
+
+    def _read_account_transaction(self) -> Tuple[Optional[bytes], Optional[Dict[str, Any]]]:
+        protected = _read_optional_bytes(
+            self.account_transaction_path,
+            MAX_ACCOUNT_TRANSACTION_BYTES,
+            "账号存储事务日志",
+        )
+        if protected is None:
+            return None, None
+        return protected, self._decode_account_transaction(protected)
+
+    def _account_transaction_is_current(self, expected: bytes) -> bool:
+        return _optional_bytes_match(
+            self.account_transaction_path,
+            expected,
+            MAX_ACCOUNT_TRANSACTION_BYTES,
+            "账号存储事务日志",
+        )
+
+    def _recover_pending_account_transaction_locked(self, abandon_external: bool = False) -> str:
+        protected, transaction = self._read_account_transaction()
+        if protected is None or transaction is None:
+            return "none"
+        profile_id = transaction.get("profile_id")
+
+        guard_errors = []
+        guard_values = []
+        for path, signature in transaction["decoded_guards"]:
+            current = _read_optional_bytes(path, self._path_limit(path, profile_id), path.name)
+            guard_values.append(current)
+            if not self._matches_signature(current, signature):
+                guard_errors.append("{}已被外部修改。".format(path.name))
+
+        states = []
+        current_values = []
+        for path, before, after_signature in transaction["decoded_changes"]:
+            current = _read_optional_bytes(path, self._path_limit(path, profile_id), path.name)
+            current_values.append(current)
+            if current == before:
+                states.append("before")
+            elif self._matches_signature(current, after_signature):
+                states.append("after")
+            else:
+                states.append("external")
+
+        if all(state == "after" for state in states) and not guard_errors:
+            _guarded_replace_optional(
+                self.account_transaction_path,
+                protected,
+                None,
+                MAX_ACCOUNT_TRANSACTION_BYTES,
+                "账号存储事务日志",
+            )
+            return "committed"
+        if all(state == "before" for state in states) and not guard_errors:
+            _guarded_replace_optional(
+                self.account_transaction_path,
+                protected,
+                None,
+                MAX_ACCOUNT_TRANSACTION_BYTES,
+                "账号存储事务日志",
+            )
+            return "rolled_back"
+
+        recovery_errors = list(guard_errors)
+        for (path, before, _after_signature), current, state in reversed(
+            list(zip(transaction["decoded_changes"], current_values, states))
+        ):
+            if state == "external":
+                recovery_errors.append("{}包含外部新内容，未覆盖。".format(path.name))
+                continue
+            if state == "before":
+                continue
+            try:
+                if not self._account_transaction_is_current(protected):
+                    raise AccountTransactionRecoveryError("账号存储事务日志在恢复期间被修改。")
+                _guarded_replace_optional(
+                    path,
+                    current,
+                    before,
+                    self._path_limit(path, profile_id),
+                    path.name,
+                )
+            except (OSError, AccountStoreError) as exc:
+                recovery_errors.append(str(exc))
+
+        fully_restored = True
+        external_stable = True
+        for (path, before, _after_signature), original_current, state in zip(
+            transaction["decoded_changes"], current_values, states
+        ):
+            try:
+                current = _read_optional_bytes(path, self._path_limit(path, profile_id), path.name)
+                if state == "external":
+                    if current != original_current:
+                        external_stable = False
+                elif current != before:
+                    fully_restored = False
+            except AccountStoreError:
+                fully_restored = False
+
+        guards_stable = True
+        for (path, _signature), original_current in zip(
+            transaction["decoded_guards"], guard_values
+        ):
+            try:
+                if (
+                    _read_optional_bytes(path, self._path_limit(path, profile_id), path.name)
+                    != original_current
+                ):
+                    guards_stable = False
+            except AccountStoreError:
+                guards_stable = False
+
+        if (
+            abandon_external
+            and fully_restored
+            and external_stable
+            and guards_stable
+            and recovery_errors
+        ):
+            _guarded_replace_optional(
+                self.account_transaction_path,
+                protected,
+                None,
+                MAX_ACCOUNT_TRANSACTION_BYTES,
+                "账号存储事务日志",
+            )
+            return "abandoned"
+        if recovery_errors or not fully_restored or not guards_stable:
+            detail = "；".join(recovery_errors) or "部分文件未能恢复到事务前状态。"
+            raise AccountTransactionRecoveryError(
+                "检测到未完成的账号存储事务，但无法安全恢复：{}".format(detail)
+            )
+        _guarded_replace_optional(
+            self.account_transaction_path,
+            protected,
+            None,
+            MAX_ACCOUNT_TRANSACTION_BYTES,
+            "账号存储事务日志",
+        )
+        return "rolled_back"
+
+    def _all_storage_replacements_match(
+        self,
+        changes: Sequence[Tuple[Path, Optional[bytes], Optional[bytes]]],
+        profile_id: Optional[str],
+    ) -> bool:
+        for path, _expected, replacement in changes:
+            if not _optional_bytes_match(
+                path,
+                replacement,
+                self._path_limit(path, profile_id),
+                path.name,
+            ):
+                return False
+        return True
+
+    def _rollback_storage_changes_without_journal(
+        self,
+        changes: Sequence[Tuple[Path, Optional[bytes], Optional[bytes]]],
+        profile_id: Optional[str],
+    ) -> str:
+        """Compensate owned partial writes if the account journal disappears."""
+
+        snapshots = []
+        has_external = False
+        for path, before, replacement in changes:
+            current = _read_optional_bytes(path, self._path_limit(path, profile_id), path.name)
+            if current == before:
+                state = "before"
+            elif current == replacement:
+                state = "after"
+            else:
+                state = "external"
+                has_external = True
+            snapshots.append((path, before, replacement, current, state))
+
+        if all(state == "after" for *_values, state in snapshots):
+            return "committed"
+
+        recovery_errors = []
+        for path, before, _replacement, current, state in reversed(snapshots):
+            if state != "after" or current == before:
+                continue
+            try:
+                _guarded_replace_optional(
+                    path,
+                    current,
+                    before,
+                    self._path_limit(path, profile_id),
+                    path.name,
+                )
+            except (OSError, AccountStoreError) as exc:
+                recovery_errors.append(str(exc))
+
+        for path, before, _replacement, original_current, state in snapshots:
+            try:
+                current = _read_optional_bytes(path, self._path_limit(path, profile_id), path.name)
+            except AccountStoreError as exc:
+                recovery_errors.append(str(exc))
+                continue
+            if state == "external":
+                if current != original_current:
+                    recovery_errors.append("{}的外部内容再次发生变化。".format(path.name))
+            elif current != before:
+                recovery_errors.append("{}未能恢复到事务前状态。".format(path.name))
+
+        if recovery_errors:
+            raise AccountTransactionRecoveryError(
+                "账号存储事务日志已消失，且部分写入无法安全恢复：{}".format(
+                    "；".join(recovery_errors)
+                )
+            )
+        return "abandoned" if has_external else "rolled_back"
+
+    def _assert_storage_unchanged(
+        self,
+        path: Path,
+        expected: Optional[bytes],
+        profile_id: Optional[str],
+    ) -> None:
+        if not _optional_bytes_match(
+            path,
+            expected,
+            self._path_limit(path, profile_id),
+            path.name,
+        ):
+            raise AccountStoreError(
+                "{}已在操作期间被外部修改。为避免覆盖，本次操作已取消。".format(path.name)
+            )
+
+    def _commit_storage_transaction(
+        self,
+        changes: Sequence[Tuple[Path, Optional[bytes], Optional[bytes]]],
+        operation: str,
+        profile_id: Optional[str],
+    ) -> None:
+        targets = []
+        for path, before, replacement in changes:
+            target = self._transaction_target(path, profile_id)
+            if target in targets:
+                raise AccountStoreError("账号存储事务包含重复目标。")
+            targets.append(target)
+            limit = self._path_limit(path, profile_id)
+            if before is not None and len(before) > limit:
+                raise AccountStoreError("{}事务前内容过大。".format(path.name))
+            if replacement is not None and len(replacement) > limit:
+                raise AccountStoreError("{}过大，已拒绝写入。".format(path.name))
+            self._assert_storage_unchanged(path, before, profile_id)
+
+        expected_targets = {"manifest", "manifest_backup"}
+        if operation in {"import", "update", "remove"}:
+            expected_targets.add("profile")
+        if set(targets) != expected_targets:
+            raise AccountStoreError("账号存储事务缺少或多出受管目标。")
+
+        effective_changes = [change for change in changes if change[1] != change[2]]
+        if not effective_changes:
+            return
+        transaction_bytes = self._encode_account_transaction(operation, profile_id, changes)
+        _guarded_replace_optional(
+            self.account_transaction_path,
+            None,
+            transaction_bytes,
+            MAX_ACCOUNT_TRANSACTION_BYTES,
+            "账号存储事务日志",
+        )
+
+        try:
+            if not self._account_transaction_is_current(transaction_bytes):
+                raise AccountTransactionRecoveryError("账号存储事务日志已在提交前被外部修改。")
+            for path, expected, replacement in changes:
+                if not self._account_transaction_is_current(transaction_bytes):
+                    raise AccountTransactionRecoveryError(
+                        "账号存储事务日志已在提交期间被外部修改。"
+                    )
+                self._assert_storage_unchanged(path, expected, profile_id)
+                if expected == replacement:
+                    continue
+                _guarded_replace_optional(
+                    path,
+                    expected,
+                    replacement,
+                    self._path_limit(path, profile_id),
+                    path.name,
+                )
+                if not _optional_bytes_match(
+                    path,
+                    replacement,
+                    self._path_limit(path, profile_id),
+                    path.name,
+                ):
+                    raise AccountStoreError("{}在写入后再次发生变化。".format(path.name))
+
+            for path, _expected, replacement in changes:
+                if not _optional_bytes_match(
+                    path,
+                    replacement,
+                    self._path_limit(path, profile_id),
+                    path.name,
+                ):
+                    raise AccountStoreError("{}在事务完成前再次发生变化。".format(path.name))
+            _guarded_replace_optional(
+                self.account_transaction_path,
+                transaction_bytes,
+                None,
+                MAX_ACCOUNT_TRANSACTION_BYTES,
+                "账号存储事务日志",
+            )
+        except (OSError, AccountStoreError) as exc:
+            try:
+                recovery = self._recover_pending_account_transaction_locked(abandon_external=True)
+            except AccountStoreError as recovery_error:
+                raise AccountTransactionRecoveryError(
+                    "账号存储写入失败，且未能完整恢复：{}".format(recovery_error)
+                ) from exc
+            if recovery == "committed" or (
+                recovery == "none" and self._all_storage_replacements_match(changes, profile_id)
+            ):
+                return
+            if recovery == "none":
+                recovery = self._rollback_storage_changes_without_journal(changes, profile_id)
+                if recovery == "committed":
+                    return
+            if recovery == "abandoned":
+                raise AccountStoreError(
+                    "检测到操作期间的外部修改；已恢复本程序自身写入并保留外部内容。"
+                ) from exc
+            if isinstance(exc, AccountStoreError):
+                raise
+            raise AccountStoreError("无法写入账号存储：{}".format(exc)) from exc
+
+    def _recover_legacy_remove_tombstones_locked(self) -> None:
+        if not self.storage_directory.exists():
+            return
+        try:
+            entries = tuple(self.storage_directory.iterdir())
+        except OSError as exc:
+            raise AccountTransactionRecoveryError(
+                "无法检查旧版移除临时文件：{}".format(exc)
+            ) from exc
+        tombstones = []
+        seen_ids = set()
+        for path in entries:
+            match = _LEGACY_REMOVE_PATTERN.fullmatch(path.name)
+            if match is None:
+                continue
+            profile_id = match.group("profile_id")
+            if profile_id in seen_ids:
+                raise AccountTransactionRecoveryError(
+                    "同一账号存在多个旧版移除临时文件，已停止自动恢复。"
+                )
+            seen_ids.add(profile_id)
+            tombstones.append((profile_id, path))
+        if not tombstones:
+            return
+
+        manifest_bytes = _read_optional_bytes(
+            self.manifest_path,
+            MAX_MANIFEST_FILE_BYTES,
+            "账号清单",
+        )
+        if manifest_bytes is None:
+            raise AccountTransactionRecoveryError(
+                "发现旧版移除临时文件，但主账号清单缺失，无法判断应恢复还是删除。"
+            )
+        try:
+            manifest_profiles = self._read_manifest(self.manifest_path)
+        except AccountStoreError as exc:
+            raise AccountTransactionRecoveryError(
+                "发现旧版移除临时文件，但主账号清单不可用，已停止自动恢复。"
+            ) from exc
+        manifest_ids = {profile.profile_id for profile in manifest_profiles}
+
+        for profile_id, tombstone in tombstones:
+            if not _optional_bytes_match(
+                self.manifest_path,
+                manifest_bytes,
+                MAX_MANIFEST_FILE_BYTES,
+                "账号清单",
+            ):
+                raise AccountTransactionRecoveryError("账号清单在旧版恢复期间被外部修改。")
+            tombstone_bytes = _read_optional_bytes(
+                tombstone,
+                MAX_AUTH_FILE_BYTES,
+                "旧版移除临时文件",
+            )
+            if tombstone_bytes is None:
+                continue
+            source = self._profile_path_from_id(profile_id)
+            source_bytes = _read_optional_bytes(
+                source,
+                MAX_AUTH_FILE_BYTES,
+                "账号认证副本",
+            )
+            if profile_id in manifest_ids:
+                if source_bytes is None:
+                    _guarded_replace_optional(
+                        source,
+                        None,
+                        tombstone_bytes,
+                        MAX_AUTH_FILE_BYTES,
+                        source.name,
+                    )
+                elif source_bytes != tombstone_bytes:
+                    raise AccountTransactionRecoveryError(
+                        "旧版移除恢复遇到外部新认证副本，已保留双方内容并停止。"
+                    )
+                _guarded_replace_optional(
+                    tombstone,
+                    tombstone_bytes,
+                    None,
+                    MAX_AUTH_FILE_BYTES,
+                    tombstone.name,
+                )
+            else:
+                if source_bytes is not None:
+                    raise AccountTransactionRecoveryError(
+                        "旧版移除状态与主账号清单冲突，已停止自动清理。"
+                    )
+                _guarded_replace_optional(
+                    tombstone,
+                    tombstone_bytes,
+                    None,
+                    MAX_AUTH_FILE_BYTES,
+                    tombstone.name,
+                )
 
     @contextmanager
     def codex_operation_guard(self, target_auth_path: Path) -> Iterator[None]:
         """Serialize a Codex mutation across threads and app processes."""
 
-        target = Path(target_auth_path).resolve()
-        target_lock = _shared_file_lock(target.parent / TARGET_LOCK_FILE_NAME)
-        with target_lock.hold(self.lock_timeout, "Codex 操作锁"):
+        with codex_operation_guard(target_auth_path, self.lock_timeout):
             yield
 
     @contextmanager
@@ -498,15 +1388,54 @@ class ProfileStore:
                     return profiles
             raise primary_error
 
-    def _save_profiles(self, profiles: List[AccountProfile]) -> None:
+    @staticmethod
+    def _serialize_profiles(profiles: List[AccountProfile]) -> bytes:
         payload: Dict[str, Any] = {
             "version": 1,
             "profiles": [profile.to_dict() for profile in profiles],
         }
+        try:
+            value = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        except (TypeError, UnicodeError, ValueError) as exc:
+            raise AccountStoreError("无法序列化账号清单：{}".format(exc)) from exc
+        if len(value) > MAX_MANIFEST_FILE_BYTES:
+            raise AccountStoreError("账号清单文件过大，已拒绝写入。")
+        return value
 
-        if self.manifest_path.exists() and not self.recovered_from_backup:
-            _atomic_copy(self.manifest_path, self.manifest_backup_path)
-        _atomic_write_json(self.manifest_path, payload)
+    def _save_profiles(
+        self,
+        profiles: List[AccountProfile],
+        *,
+        operation: str = "repair",
+        profile_id: Optional[str] = None,
+        profile_change: Optional[Tuple[Path, Optional[bytes], Optional[bytes]]] = None,
+    ) -> None:
+        before_manifest = _read_optional_bytes(
+            self.manifest_path,
+            MAX_MANIFEST_FILE_BYTES,
+            "账号清单",
+        )
+        before_backup = _read_optional_bytes(
+            self.manifest_backup_path,
+            MAX_MANIFEST_FILE_BYTES,
+            "账号清单备份",
+        )
+        after_manifest = self._serialize_profiles(profiles)
+        after_backup = (
+            before_manifest
+            if before_manifest is not None and not self.recovered_from_backup
+            else before_backup
+        )
+        changes: List[Tuple[Path, Optional[bytes], Optional[bytes]]] = []
+        if profile_change is not None:
+            changes.append(profile_change)
+        changes.extend(
+            (
+                (self.manifest_backup_path, before_backup, after_backup),
+                (self.manifest_path, before_manifest, after_manifest),
+            )
+        )
+        self._commit_storage_transaction(changes, operation, profile_id)
         self.recovered_from_backup = False
 
     def import_profile(self, source_path: Path, remark: str) -> ImportResult:
@@ -572,36 +1501,30 @@ class ProfileStore:
             sha256=source_hash,
         )
         destination = self.profile_path(profile)
-        copied = False
-
         try:
             if destination.exists():
                 raise AccountStoreError("新账号的目标文件已存在，已停止导入以免覆盖外部文件。")
-            _atomic_copy(source, destination, expected_sha256=source_hash)
-            copied = True
-            copied_hash = validate_auth_file(destination)
-            if copied_hash != source_hash:
+            source_bytes = _read_optional_bytes(
+                source,
+                MAX_AUTH_FILE_BYTES,
+                "源认证文件",
+            )
+            if source_bytes is None or hashlib.sha256(source_bytes).hexdigest() != source_hash:
                 raise AccountStoreError("源认证文件在导入过程中发生变化，请重新选择后再试。")
-            self._save_profiles(profiles + [profile])
+            if not _optional_bytes_match(
+                source,
+                source_bytes,
+                MAX_AUTH_FILE_BYTES,
+                "源认证文件",
+            ):
+                raise AccountStoreError("源认证文件在导入过程中发生变化，请重新选择后再试。")
+            self._save_profiles(
+                profiles + [profile],
+                operation="import",
+                profile_id=profile.profile_id,
+                profile_change=(destination, None, source_bytes),
+            )
         except (OSError, AccountStoreError) as exc:
-            if copied:
-                try:
-                    destination_still_ours = (
-                        destination.is_file() and _sha256_file(destination) == source_hash
-                    )
-                except OSError:
-                    destination_still_ours = False
-                if not destination_still_ours:
-                    raise AccountStoreError(
-                        "导入失败，且认证副本在写入后又发生变化；"
-                        "为避免删除外部内容，未自动清理目标文件。"
-                    ) from exc
-                try:
-                    destination.unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    pass
             if isinstance(exc, AccountStoreError):
                 raise
             raise AccountStoreError("保存账号认证文件失败：{}".format(exc)) from exc
@@ -622,7 +1545,11 @@ class ProfileStore:
         renamed = replace(profile, remark=normalized_remark)
         updated_profiles = [renamed if item.profile_id == profile_id else item for item in profiles]
         try:
-            self._save_profiles(updated_profiles)
+            self._save_profiles(
+                updated_profiles,
+                operation="rename",
+                profile_id=profile_id,
+            )
         except OSError as exc:
             raise AccountStoreError("保存账号备注失败：{}".format(exc)) from exc
         return renamed
@@ -652,6 +1579,9 @@ class ProfileStore:
         source = Path(source_path).resolve()
         source_info = _inspect_auth_file(source)
         source_hash = source_info.sha256
+        source_bytes = _read_optional_bytes(source, MAX_AUTH_FILE_BYTES, "当前认证文件")
+        if source_bytes is None or hashlib.sha256(source_bytes).hexdigest() != source_hash:
+            raise AccountStoreError("当前认证文件在读取过程中发生变化，请重试。")
         profiles = self.load_profiles()
         profile = self._find_profile(profiles, profile_id)
         destination = self.profile_path(profile)
@@ -669,6 +1599,7 @@ class ProfileStore:
 
         stored_info: Optional[_AuthFileInfo] = None
         destination_hash: Optional[str] = None
+        destination_bytes: Optional[bytes] = None
         if destination_exists:
             try:
                 stored_info = _inspect_auth_file(destination)
@@ -680,6 +1611,19 @@ class ProfileStore:
                 )
             except OSError as exc:
                 raise AccountStoreError("无法校验所选账号的现有认证副本：{}".format(exc)) from exc
+            destination_bytes = _read_optional_bytes(
+                destination,
+                MAX_AUTH_FILE_BYTES,
+                "账号认证副本",
+            )
+            if (
+                destination_bytes is None
+                or destination_hash is None
+                or hashlib.sha256(destination_bytes).hexdigest() != destination_hash
+            ):
+                raise AccountStoreError(
+                    "“{}”的认证副本在读取过程中发生变化，本次更新已取消。".format(profile.remark)
+                )
 
         if expected_sha256 is not None and (
             stored_info is None or stored_info.sha256 != expected_sha256
@@ -756,19 +1700,27 @@ class ProfileStore:
                 repaired if item.profile_id == profile_id else item for item in profiles
             ]
             try:
-                self._save_profiles(repaired_profiles)
+                self._save_profiles(
+                    repaired_profiles,
+                    operation="repair",
+                    profile_id=profile_id,
+                )
             except OSError as exc:
                 raise AccountStoreError("修复账号记录失败：{}".format(exc)) from exc
             return UpdateResult(profile=repaired, changed=True, backup_path=None)
 
         backup_path: Optional[Path] = None
-        copied = False
         try:
             if destination_exists:
                 if (
                     destination_hash is None
-                    or not destination.is_file()
-                    or _sha256_file(destination) != destination_hash
+                    or destination_bytes is None
+                    or not _optional_bytes_match(
+                        destination,
+                        destination_bytes,
+                        MAX_AUTH_FILE_BYTES,
+                        "账号认证副本",
+                    )
                 ):
                     raise AccountStoreError(
                         "“{}”的认证副本刚刚发生变化，本次更新已取消，以免覆盖较新的认证。".format(
@@ -790,7 +1742,12 @@ class ProfileStore:
                     raise AccountStoreError(
                         "“{}”的认证副本在备份时发生变化，本次更新已取消。".format(profile.remark)
                     )
-                if not destination.is_file() or _sha256_file(destination) != destination_hash:
+                if not _optional_bytes_match(
+                    destination,
+                    destination_bytes,
+                    MAX_AUTH_FILE_BYTES,
+                    "账号认证副本",
+                ):
                     raise AccountStoreError(
                         "“{}”的认证副本在备份后发生变化，本次更新已取消，以免覆盖较新的认证。".format(
                             profile.remark
@@ -802,11 +1759,12 @@ class ProfileStore:
                         profile.remark
                     )
                 )
-            _atomic_copy(source, destination, expected_sha256=source_hash)
-            copied = True
-
-            copied_hash = validate_auth_file(destination)
-            if copied_hash != source_hash:
+            if not _optional_bytes_match(
+                source,
+                source_bytes,
+                MAX_AUTH_FILE_BYTES,
+                "当前认证文件",
+            ):
                 raise AccountStoreError("当前认证文件在更新过程中发生变化，请重试。")
 
             updated = replace(
@@ -817,40 +1775,13 @@ class ProfileStore:
             updated_profiles = [
                 updated if item.profile_id == profile_id else item for item in profiles
             ]
-            self._save_profiles(updated_profiles)
+            self._save_profiles(
+                updated_profiles,
+                operation="update",
+                profile_id=profile_id,
+                profile_change=(destination, destination_bytes, source_bytes),
+            )
         except (OSError, AccountStoreError) as exc:
-            if copied:
-                try:
-                    destination_still_ours = (
-                        destination.is_file() and _sha256_file(destination) == source_hash
-                    )
-                except OSError:
-                    destination_still_ours = False
-                if not destination_still_ours:
-                    backup_note = (
-                        "旧副本已保留在“更新备份”目录"
-                        if backup_path is not None
-                        else "更新前没有旧副本"
-                    )
-                    raise AccountStoreError(
-                        "更新失败，且认证副本在写入后又发生变化；为避免覆盖新内容，"
-                        "未自动恢复。{}。".format(backup_note)
-                    ) from exc
-                try:
-                    if backup_path is not None and backup_path.is_file():
-                        _atomic_copy(
-                            backup_path,
-                            destination,
-                            expected_sha256=destination_hash,
-                        )
-                    else:
-                        destination.unlink()
-                except FileNotFoundError:
-                    pass
-                except (OSError, AccountStoreError) as restore_error:
-                    raise AccountStoreError(
-                        "更新失败，且无法恢复原认证文件：{}".format(restore_error)
-                    ) from exc
             if isinstance(exc, AccountStoreError):
                 raise
             raise AccountStoreError("更新账号认证文件失败：{}".format(exc)) from exc
@@ -866,40 +1797,22 @@ class ProfileStore:
         profile = self._find_profile(profiles, profile_id)
         remaining = [item for item in profiles if item.profile_id != profile_id]
         source = self.profile_path(profile)
-        tombstone = self.storage_directory / ".{}.{}.remove".format(
-            source.name,
-            uuid.uuid4().hex,
-        )
-        moved = False
-        manifest_saved = False
-
         try:
             if source.exists():
                 if not source.is_file():
                     raise AccountStoreError("所选账号的认证文件不是普通文件，无法移除。")
-                os.replace(str(source), str(tombstone))
-                moved = True
-
-            self._save_profiles(remaining)
-            manifest_saved = True
-            if moved:
-                tombstone.unlink()
+            source_bytes = _read_optional_bytes(
+                source,
+                MAX_AUTH_FILE_BYTES,
+                "账号认证副本",
+            )
+            self._save_profiles(
+                remaining,
+                operation="remove",
+                profile_id=profile.profile_id,
+                profile_change=(source, source_bytes, None),
+            )
         except (OSError, AccountStoreError) as exc:
-            restore_errors = []
-            if moved and tombstone.exists():
-                try:
-                    os.replace(str(tombstone), str(source))
-                except OSError as restore_error:
-                    restore_errors.append(str(restore_error))
-            if manifest_saved:
-                try:
-                    self._save_profiles(profiles)
-                except (OSError, AccountStoreError) as restore_error:
-                    restore_errors.append(str(restore_error))
-            if restore_errors:
-                raise AccountStoreError(
-                    "移除失败，且无法完整恢复原账号：{}".format("；".join(restore_errors))
-                ) from exc
             if isinstance(exc, AccountStoreError):
                 raise
             raise AccountStoreError("移除账号失败：{}".format(exc)) from exc
